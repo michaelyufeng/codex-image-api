@@ -1,147 +1,143 @@
 # codex-image-api
 
-把 **Codex / ChatGPT 订阅额度**的生图能力，包装成一个**本地 OpenAI 兼容 HTTP API**。
-现有调用 OpenAI 图片接口的项目，**只改 `base_url` 一行**就能切过来，省掉每张图的 API 费用。
+**English** · [简体中文](README.zh-CN.md)
 
-> ⚠️ **免责声明 / Disclaimer**：本项目仅供 **学习研究** 与 **个人复用自己的 ChatGPT/Codex 订阅额度**。
-> 它经 Codex CLI 的官方 OAuth 以订阅额度驱动生图，**可能不符合 OpenAI 服务条款**——是否使用、如何使用
-> 由你**自行判断并承担全部风险**。**请勿用于商业用途或对外大规模分发。** 作者不对账号处置或任何后果负责。
+Wrap the image-generation capability of your **Codex / ChatGPT subscription** as a **local, OpenAI-compatible HTTP API**. Any project that already calls the OpenAI image API can switch over by changing **one line — `base_url`** — and stop paying per-image API fees.
+
+> ⚠️ **Disclaimer** — This project is for **learning / research** and **personal reuse of your own ChatGPT/Codex subscription** only. It drives image generation through Codex CLI's official OAuth on your subscription quota, which **may violate OpenAI's Terms of Service**. Whether and how you use it is **entirely at your own risk**. **Do not use it commercially or distribute it widely.** The author is not responsible for account action or any consequences.
 
 ```
-你的项目 (OpenAI SDK) ──▶ http://127.0.0.1:10532/v1/images/generations
-                      ──▶ 包装成 Responses API 的 image_generation 工具调用
-                      ──▶ https://chatgpt.com/backend-api/codex/responses
-                          (复用 ~/.codex/auth.json 的 OAuth token，和 Codex CLI 同款)
-                      ──▶ 解析 SSE 流，返回标准 OpenAI Images 格式
+your project (OpenAI SDK) ──▶ http://127.0.0.1:10532/v1/images/generations
+                          ──▶ wrapped as a Responses-API image_generation tool call
+                          ──▶ https://chatgpt.com/backend-api/codex/responses
+                              (OAuth token from ~/.codex/auth.json — same as Codex CLI)
+                          ──▶ parse the SSE stream → standard OpenAI Images JSON
 ```
 
-## 特点
+## Features
 
-- **零第三方依赖**：纯 Python 标准库，无 telemetry，好审计、好部署。
-- **走订阅额度**：只连 `chatgpt.com` + `auth.openai.com`，全程不碰 `api.openai.com` / `OPENAI_API_KEY`。
-- **OpenAI 兼容**：`/v1/images/generations`（文生图）、`/v1/images/edits`（图生图）、`/v1/models`。
-- **文生图 + 图生图 + 批量 + URL 返回**，并发限流防止被限流。
+- **Zero third-party dependencies** — pure Python standard library, no telemetry; easy to audit and deploy.
+- **Subscription-backed** — talks only to `chatgpt.com` + `auth.openai.com`; never touches `api.openai.com` / `OPENAI_API_KEY`.
+- **OpenAI-compatible** — `/v1/images/generations` (text→image), `/v1/images/edits` (image→image), `/v1/models`.
+- **Text→image, image→image, batching, URL output**, with concurrency limiting to avoid upstream rate limits.
 
-> ⚠️ **合规提醒**：本工具复用 Codex CLI 的官方 OAuth 流程（非抓包逆向），属于「灰色地带但用官方认证」。
-> 仅供个人复用自己的订阅额度，**请勿对外大规模分发**。是否计费请自行在
-> `platform.openai.com` 用量页核对（正常应只见 ChatGPT 订阅用量、无 Images API 计费）。
+> ⚠️ **Billing & compliance** — This tool reuses Codex CLI's official OAuth flow (not packet-sniffing / reverse-engineering) — a "gray area, but with official auth." For personal reuse of your own quota only. Verify billing yourself on `platform.openai.com` (you should see only ChatGPT subscription usage, no Images API charges).
 
-## 前置要求
+## Requirements
 
-- 已安装 [Codex CLI](https://github.com/openai/codex) 并完成登录（`codex login`），即存在 `~/.codex/auth.json`。
-- Python 3.10+（开发环境为 3.14）。
+- [Codex CLI](https://github.com/openai/codex) installed and logged in (`codex login`) — i.e. `~/.codex/auth.json` exists.
+- Python 3.10+ (developed on 3.14).
 
-## 安装为 Claude Code 插件（推荐）
+## Install as a Claude Code plugin (recommended)
 
-本仓库本身就是一个 Claude Code 插件 + 市场。装上后即获得两个 skill——`generate-image`（生图/改图）与 `connect-api`（把现有项目切到本地 API）——后端 server 由 skill **按需自启**，无需手动管理。
+This repo is itself a Claude Code plugin + marketplace. Once installed you get two skills — `generate-image` (create / edit images) and `connect-api` (switch an existing project to the local API) — and the backend server is **auto-started on demand** by the skills, so you never manage it by hand.
 
-在 Claude Code 里执行：
+In Claude Code:
 
 ```bash
 /plugin marketplace add michaelyufeng/codex-image-api
 /plugin install codex-image-api@codex-image-api
 ```
 
-装好后直接说「画一张赛博朋克风格的猫」即可触发生图；说「把这个项目接入本地生图 API」即可触发接入。skill 脚本用 `${CLAUDE_PLUGIN_ROOT}` 定位插件内的 server，**不依赖任何硬编码路径**。
+Then just say *"draw a cyberpunk cat"* to trigger generation, or *"switch this project to the local image API"* to trigger connect. The skill scripts locate the bundled server via `${CLAUDE_PLUGIN_ROOT}` — **no hardcoded paths**.
 
-> 只想要 HTTP API、不需要 skill？跳过本节，直接看下面用 `./run.sh` 起服务。
+> Only want the HTTP API, not the skills? Skip this section and run the server with `./run.sh` below.
 
-## 启动
+## Run the server (HTTP-API only)
 
 ```bash
-./run.sh          # 前台运行
-./run.sh bg       # 后台运行，日志在 /tmp/codex-image-api.log
-./run.sh stop     # 停止后台进程
-# 或直接：
+./run.sh          # foreground
+./run.sh bg       # background, logs at /tmp/codex-image-api.log
+./run.sh stop     # stop the background server
+# or directly:
 python3 server.py
 ```
 
-默认监听 `http://127.0.0.1:10532`。健康检查：
+Listens on `http://127.0.0.1:10532` by default. Health check:
 
 ```bash
 curl http://127.0.0.1:10532/health
 # {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3, "version": "0.3"}
 ```
 
-## 在你的项目里使用（改一行）
+## Use in your project (change one line)
 
 ```python
 from openai import OpenAI
 import base64
 
-client = OpenAI(base_url="http://127.0.0.1:10532/v1", api_key="unused")  # ← 只改这行
+client = OpenAI(base_url="http://127.0.0.1:10532/v1", api_key="unused")  # ← only this line
 
-# 文生图
-r = client.images.generate(model="gpt-image-2", prompt="一只戴橙围巾的水獭", size="1024x1024")
+# text → image
+r = client.images.generate(model="gpt-image-2", prompt="an otter in an orange scarf", size="1024x1024")
 open("out.png", "wb").write(base64.b64decode(r.data[0].b64_json))
 
-# 图生图
+# image → image
 r2 = client.images.edit(model="gpt-image-2", image=open("out.png", "rb"),
-                        prompt="把围巾改成蓝色")
+                        prompt="change the scarf to blue")
 open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 ```
 
-更多示例见 [`examples/`](./examples/)。
+More in [`examples/`](./examples/).
 
 ## API
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 |---|---|---|
-| `POST` | `/v1/images/generations` | 文生图（JSON）。支持 `n`、`response_format`、`reference_images` 扩展 |
-| `POST` | `/v1/images/edits` | 图生图（multipart，OpenAI SDK `images.edit` 入口） |
-| `GET` | `/images/<name>` | `response_format=url` 时托管生成的图片 |
-| `GET` | `/health` | 服务与 token 状态 |
-| `GET` | `/v1/models` | 模型列表 |
+| `POST` | `/v1/images/generations` | text→image (JSON). Supports `n`, `response_format`, and a `reference_images` extension |
+| `POST` | `/v1/images/edits` | image→image (multipart, OpenAI SDK `images.edit` entry point) |
+| `GET`  | `/images/<name>` | serves generated images when `response_format=url` |
+| `GET`  | `/health` | service + token status |
+| `GET`  | `/v1/models` | model list |
 
-### 请求参数（generations）
+### Request parameters (generations)
 
-| 字段 | 默认 | 可选值 |
+| Field | Default | Allowed |
 |---|---|---|
-| `prompt` | （必填） | 任意文本 |
+| `prompt` | *(required)* | any text |
 | `size` | `1024x1024` | `1024x1024` / `1024x1536` / `1536x1024` / `auto` |
 | `quality` | `high` | `low` / `medium` / `high` / `auto` |
 | `n` | `1` | `1`–`8` |
 | `response_format` | `b64_json` | `b64_json` / `url` |
-| `reference_images` | `[]` | 数组，元素为本地路径 / http(s) URL / `data:` URL / `{"data","mime"}`（图生图扩展） |
+| `reference_images` | `[]` | array of local path / http(s) URL / `data:` URL / `{"data","mime"}` (image→image extension) |
 
-## 配置（环境变量）
+## Configuration (environment variables)
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `CODEX_IMAGE_HOST` | `127.0.0.1` | 监听地址 |
-| `CODEX_IMAGE_PORT` | `10532` | 监听端口 |
-| `CODEX_IMAGE_MODEL` | `gpt-5.4-mini` | 驱动 image_generation 工具的编排模型 |
-| `CODEX_IMAGE_CONCURRENCY` | `3` | 同时打到上游的最大生图数 |
-| `CODEX_IMAGE_MAX_N` | `8` | 单次请求 `n` 上限 |
-| `CODEX_IMAGE_DIR` | `./generated` | `url` 模式落盘目录 |
-| `CODEX_IMAGE_AUTH_FILE` | （自动） | 覆盖 `auth.json` 路径 |
-| `CODEX_IMAGE_PUBLIC_BASE` | `http://HOST:PORT` | `url` 模式返回的地址前缀 |
-| `CODEX_IMAGE_ALLOWED_HOSTS` | （自动） | 额外放行的 `Host` 头（逗号分隔）；默认仅放行 localhost，挡 DNS rebinding |
-| `CODEX_IMAGE_MAX_BODY` | `67108864` | 单次请求体上限（字节，超出返回 413） |
-| `CODEX_IMAGE_MAX_REFS` | `16` | 单次请求 `reference_images` / 上传图片数量上限 |
+| `CODEX_IMAGE_HOST` | `127.0.0.1` | listen address |
+| `CODEX_IMAGE_PORT` | `10532` | listen port |
+| `CODEX_IMAGE_MODEL` | `gpt-5.4-mini` | orchestration model driving the image_generation tool |
+| `CODEX_IMAGE_CONCURRENCY` | `3` | max concurrent upstream generations |
+| `CODEX_IMAGE_MAX_N` | `8` | per-request `n` cap |
+| `CODEX_IMAGE_DIR` | `./generated` | output dir for `url` mode |
+| `CODEX_IMAGE_AUTH_FILE` | *(auto)* | override `auth.json` path |
+| `CODEX_IMAGE_PUBLIC_BASE` | `http://HOST:PORT` | address prefix returned in `url` mode |
+| `CODEX_IMAGE_ALLOWED_HOSTS` | *(auto)* | extra allowed `Host` headers (comma-separated); only localhost by default — blocks DNS rebinding |
+| `CODEX_IMAGE_MAX_BODY` | `67108864` | max request body in bytes (returns 413 if exceeded) |
+| `CODEX_IMAGE_MAX_REFS` | `16` | max `reference_images` / uploaded images per request |
 
-## 开机自启（macOS launchd）
-
-见 [`deploy/`](./deploy/) 下的 LaunchAgent 模板与安装说明。
-
-## 项目结构
+## Project structure
 
 ```
-.claude-plugin/      插件 + 市场清单（plugin.json / marketplace.json）
-skills/              捆绑的两个 skill：generate-image（生图）、connect-api（接入）
-server.py            HTTP 服务：OpenAI 兼容路由 + 上游 Responses 调用 + SSE 解析 + token 刷新
-_codex_auth.py       auth.json 发现 + JWT 解码（零副作用），被 server.py 与 lib_preflight.py 共用
-lib_preflight.py     skill 的前置检查：Codex 登录态探测 + 服务自启（自启逻辑唯一来源）
-run.sh               控制脚本：前台 / 后台(bg) / 停止(stop) / 安装开机自启(install-launchd)
-deploy/*.plist       macOS LaunchAgent 模板（安装时填充真实路径）
-examples/            curl + Python(OpenAI SDK) 调用示例
+.claude-plugin/   plugin + marketplace manifests (plugin.json / marketplace.json)
+skills/           the two bundled skills: generate-image, connect-api
+server.py         HTTP service: OpenAI-compatible routes + upstream Responses call + SSE parsing + token refresh
+_codex_auth.py    auth.json discovery + JWT decode (zero side effects); shared by server.py and lib_preflight.py
+lib_preflight.py  skill preflight: Codex login-state detection + server auto-start (single source of auto-start logic)
+run.sh            control script: foreground / bg / stop / install-launchd
+deploy/*.plist    macOS LaunchAgent template (placeholders filled on install)
+examples/         curl + Python (OpenAI SDK) usage
 ```
 
-> skill 脚本（`skills/*/`）通过 `__file__` 相对定位本仓库根的 `lib_preflight.py`/`server.py`，
-> 因此无论插件被安装到哪里都能找到后端；`CODEX_IMAGE_SERVER_DIR` 可覆盖指向另一处源码。
+> The skill scripts (`skills/*/`) locate the repo-root `lib_preflight.py` / `server.py` relative to `__file__`, so they find the backend wherever the plugin is installed; set `CODEX_IMAGE_SERVER_DIR` to point at a source checkout elsewhere.
 
-## 已知限制
+## Autostart on boot (macOS launchd)
 
-- 单账号并发生图由上游排队，`n>1` 实际接近串行耗时。
-- `response_format=url` 的图片落在本地 `generated/`，仅本机可访问（已被 `.gitignore` 忽略）。
-- 生图较慢（low ≈ 40s，high 更久），属于走 agent 通道的固有开销。
+See the LaunchAgent template and install notes under [`deploy/`](./deploy/).
+
+## Limitations
+
+- Single-account generation is queued upstream, so `n>1` is close to serial in wall-clock time.
+- `response_format=url` images land in local `generated/` and are only reachable on this machine (gitignored).
+- Generation is slow (low ≈ 40s, high longer) — inherent overhead of going through the agent channel.
