@@ -3,6 +3,10 @@
 把 **Codex / ChatGPT 订阅额度**的生图能力，包装成一个**本地 OpenAI 兼容 HTTP API**。
 现有调用 OpenAI 图片接口的项目，**只改 `base_url` 一行**就能切过来，省掉每张图的 API 费用。
 
+> ⚠️ **免责声明 / Disclaimer**：本项目仅供 **学习研究** 与 **个人复用自己的 ChatGPT/Codex 订阅额度**。
+> 它经 Codex CLI 的官方 OAuth 以订阅额度驱动生图，**可能不符合 OpenAI 服务条款**——是否使用、如何使用
+> 由你**自行判断并承担全部风险**。**请勿用于商业用途或对外大规模分发。** 作者不对账号处置或任何后果负责。
+
 ```
 你的项目 (OpenAI SDK) ──▶ http://127.0.0.1:10532/v1/images/generations
                       ──▶ 包装成 Responses API 的 image_generation 工具调用
@@ -32,6 +36,7 @@
 ```bash
 ./run.sh          # 前台运行
 ./run.sh bg       # 后台运行，日志在 /tmp/codex-image-api.log
+./run.sh stop     # 停止后台进程
 # 或直接：
 python3 server.py
 ```
