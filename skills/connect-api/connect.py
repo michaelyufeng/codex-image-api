@@ -82,12 +82,10 @@ def main() -> None:
     else:
         sys.exit("[错误] 本地 API 探测失败，请查看 /tmp/codex-image-api.log")
 
-    # 6) 已知项目专项提示（通用工具不混入特化逻辑，仅"检测到则提示"）
-    if (project / "example" / "adapters" / "imagegen.py").exists():
-        print("\n[示例项目提示] 切到本地后实际不再产生 OpenAI 费用，但注意：")
-        print("  • 成本看板仍按官方价记账（cost_usd/cost_cny）→ 数字会虚高")
-        print("  • 预算 guard（BUDGET_PER_ITEM_USD / _PER_DAY_USD）可能按预测成本误拦")
-        print("    需要时调大它们，或后续把 imagegen 成本逻辑改成订阅模式记 0")
+    # 6) 通用成本提示（适用于任何带成本看板/预算 guard 的项目）
+    print("\n[提示] 切到本地后实际不再产生 OpenAI Images API 费用。若你的项目内置了")
+    print("  按官方价记账的成本看板或预算 guard，数字会虚高、甚至可能按预测成本误拦——")
+    print("  需要时把相应阈值调大，或把成本逻辑改成订阅模式记 0。")
 
     # 7) 完成
     print(f"\n[完成]「{project.name}」已接入 codex-image-api（base_url={preflight.API_BASE_URL}）")

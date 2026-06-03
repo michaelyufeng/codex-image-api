@@ -3,3 +3,6 @@ __pycache__/
 generated/
 .DS_Store
 *.log
+
+# Local Claude Code project notes — kept on disk, not published
+CLAUDE.md

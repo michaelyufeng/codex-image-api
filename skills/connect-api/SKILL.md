@@ -12,7 +12,7 @@ description: 把一个现有项目从 OpenAI 官方 API 一键切到本地 codex
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/connect-api/connect.py" "<项目路径>"
 # 例：
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/connect-api/connect.py" "/Users/user/Claude code/example"
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/connect-api/connect.py" "/path/to/your/project"
 ```
 
 ## 给 Claude 的执行指引
