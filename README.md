@@ -40,7 +40,7 @@ python3 server.py
 
 ```bash
 curl http://127.0.0.1:10532/health
-# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3, "version": "0.2"}
+# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3, "version": "0.3"}
 ```
 
 ## 在你的项目里使用（改一行）
@@ -96,6 +96,9 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 | `CODEX_IMAGE_DIR` | `./generated` | `url` 模式落盘目录 |
 | `CODEX_IMAGE_AUTH_FILE` | （自动） | 覆盖 `auth.json` 路径 |
 | `CODEX_IMAGE_PUBLIC_BASE` | `http://HOST:PORT` | `url` 模式返回的地址前缀 |
+| `CODEX_IMAGE_ALLOWED_HOSTS` | （自动） | 额外放行的 `Host` 头（逗号分隔）；默认仅放行 localhost，挡 DNS rebinding |
+| `CODEX_IMAGE_MAX_BODY` | `67108864` | 单次请求体上限（字节，超出返回 413） |
+| `CODEX_IMAGE_MAX_REFS` | `16` | 单次请求 `reference_images` / 上传图片数量上限 |
 
 ## 开机自启（macOS launchd）
 

@@ -55,12 +55,32 @@ TIMEOUT = int(os.environ.get("CODEX_IMAGE_TIMEOUT", "400"))
 MAX_CONCURRENCY = int(os.environ.get("CODEX_IMAGE_CONCURRENCY", "3"))
 MAX_N = int(os.environ.get("CODEX_IMAGE_MAX_N", "8"))
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_BODY_BYTES = int(os.environ.get("CODEX_IMAGE_MAX_BODY", str(64 * 1024 * 1024)))
+MAX_REF_IMAGES = int(os.environ.get("CODEX_IMAGE_MAX_REFS", "16"))
 
 REFRESH_MARGIN = 5 * 60       # refresh if access token expires within 5 min
 REFRESH_INTERVAL = 55 * 60    # ...or if last_refresh is older than 55 min
 
 IMAGE_DIR = Path(os.environ.get(
     "CODEX_IMAGE_DIR", str(Path(__file__).resolve().parent / "generated")))
+
+
+# Hosts we answer to. Rejecting other Host headers blocks DNS-rebinding: a web
+# page you visit cannot make your browser drive this localhost API under an
+# attacker-controlled hostname. Extend via CODEX_IMAGE_ALLOWED_HOSTS (comma list).
+def _host_only(netloc_or_url: str) -> str:
+    s = netloc_or_url.split("//", 1)[-1].split("/", 1)[0]
+    if s.startswith("["):                       # IPv6 literal, e.g. [::1]:port
+        return s[1:s.index("]")] if "]" in s else s
+    return s.rsplit(":", 1)[0] if ":" in s else s
+
+
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+if HOST and HOST != "0.0.0.0":
+    ALLOWED_HOSTS.add(HOST)
+ALLOWED_HOSTS.add(_host_only(PUBLIC_BASE))
+ALLOWED_HOSTS.update(
+    h.strip() for h in os.environ.get("CODEX_IMAGE_ALLOWED_HOSTS", "").split(",") if h.strip())
 
 DEVELOPER_PROMPT = (
     "You are an image-generation assistant. Always invoke the image_generation "
@@ -204,6 +224,15 @@ def get_auth() -> dict:
 # --------------------------------------------------------------------------- #
 # Reference images (img->img): build `input_image` content parts
 # --------------------------------------------------------------------------- #
+def _looks_like_image(buf: bytes) -> bool:
+    """True only if buf starts with a known image magic number."""
+    return (buf[:4] == b"\x89PNG"
+            or buf[:3] == b"\xff\xd8\xff"
+            or (buf[:4] == b"RIFF" and buf[8:12] == b"WEBP")
+            or buf[:6] in (b"GIF87a", b"GIF89a")
+            or buf[:2] == b"BM")
+
+
 def _sniff_image_mime(buf: bytes) -> str:
     if buf[:4] == b"\x89PNG":
         return "image/png"
@@ -241,7 +270,9 @@ def _resolve_reference(spec) -> dict:
         if not os.path.isfile(resolved):
             raise ValueError(f"reference image not found: {spec}")
         with open(resolved, "rb") as f:
-            data = f.read()
+            data = f.read(MAX_UPLOAD_BYTES + 1)  # bound memory; size re-checked below
+        if not _looks_like_image(data):  # don't ship arbitrary local files upstream
+            raise ValueError("reference path is not a recognized image; refused")
         return _image_part_from_bytes(data, EXT_MIME.get(Path(resolved).suffix.lower()))
     if isinstance(spec, dict) and spec.get("data"):
         mime = spec.get("mime", "image/png")
@@ -411,6 +442,14 @@ def _parse_multipart(body: bytes, boundary: str) -> list[dict]:
     return parts
 
 
+def _coerce_n(raw) -> int:
+    """Parse n; return a sentinel that _common rejects cleanly on bad input."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _extract_params(m: dict) -> dict:
     """Pull the shared image params (with defaults) from a JSON / form mapping."""
     return {
@@ -418,7 +457,7 @@ def _extract_params(m: dict) -> dict:
         "size": m.get("size") or "1024x1024",
         "quality": m.get("quality") or "high",
         "moderation": m.get("moderation") or "low",
-        "n": int(m.get("n") or 1),
+        "n": _coerce_n(m.get("n") or 1),
         "response_format": m.get("response_format") or "b64_json",
     }
 
@@ -427,7 +466,7 @@ def _extract_params(m: dict) -> dict:
 # HTTP server (OpenAI-compatible surface)
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
-    server_version = "codex-image-api/0.2"
+    server_version = "codex-image-api/0.3"
     protocol_version = "HTTP/1.1"
 
     # -- helpers ---------------------------------------------------------- #
@@ -442,9 +481,22 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error(self, code: int, msg: str, typ: str = "invalid_request_error") -> None:
         self._send_json(code, {"error": {"message": msg, "type": typ}})
 
-    def _read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", "0"))
+    def _read_body(self) -> bytes | None:
+        """Read the body, or send 413 + return None if it exceeds the cap."""
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > MAX_BODY_BYTES:
+            self.close_connection = True  # don't desync the keep-alive stream
+            self._send_error(413, f"request body exceeds {MAX_BODY_BYTES} bytes",
+                             "payload_too_large")
+            return None
         return self.rfile.read(length) if length else b""
+
+    def _host_ok(self) -> bool:
+        """Reject Host headers we don't recognize (anti DNS-rebinding)."""
+        host = self.headers.get("Host", "")
+        name = (host[1:host.index("]")] if host.startswith("[") and "]" in host
+                else host.rsplit(":", 1)[0] if ":" in host else host)
+        return name in ALLOWED_HOSTS or host in ALLOWED_HOSTS
 
     def log_message(self, format, *args):  # noqa: A002 (match base signature)
         print(f"[{self.log_date_time_string()}] {format % args}")
@@ -478,6 +530,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routes ----------------------------------------------------------- #
     def do_GET(self):
+        if not self._host_ok():
+            return self._send_error(403, "host not allowed", "forbidden")
         if self.path == "/health":
             try:
                 a = get_auth()
@@ -485,7 +539,7 @@ class Handler(BaseHTTPRequestHandler):
                 detail = f"expires in {int(exp - time.time())}s" if exp else "loaded"
                 self._send_json(200, {"ok": True, "auth": detail,
                                       "model": ORCHESTRATION_MODEL,
-                                      "concurrency": MAX_CONCURRENCY, "version": "0.2"})
+                                      "concurrency": MAX_CONCURRENCY, "version": "0.3"})
             except Exception as e:
                 self._send_json(200, {"ok": False, "auth": str(e)})
             return
@@ -511,6 +565,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
+        if not self._host_ok():
+            return self._send_error(403, "host not allowed", "forbidden")
         route = self.path.rstrip("/")
         if route == "/v1/images/generations":
             return self._handle_generations()
@@ -519,12 +575,18 @@ class Handler(BaseHTTPRequestHandler):
         self._send_error(404, f"not found: {self.path}", "not_found")
 
     def _handle_generations(self):
+        body = self._read_body()
+        if body is None:
+            return  # 413 already sent
         try:
-            req = json.loads(self._read_body() or b"{}")
+            req = json.loads(body or b"{}")
         except Exception:
             return self._send_error(400, "invalid JSON body")
+        refs = req.get("reference_images") or []
+        if len(refs) > MAX_REF_IMAGES:
+            return self._send_error(400, f"too many reference_images (max {MAX_REF_IMAGES})")
         try:
-            ref_parts = [_resolve_reference(s) for s in (req.get("reference_images") or [])]
+            ref_parts = [_resolve_reference(s) for s in refs]
         except Exception as e:
             return self._send_error(400, f"bad reference_images: {e}")
         self._common(ref_parts=ref_parts, **_extract_params(req))
@@ -535,7 +597,10 @@ class Handler(BaseHTTPRequestHandler):
         if "multipart/form-data" not in ctype or not m:
             return self._send_error(400, "expected multipart/form-data with a boundary")
         boundary = m.group(1).strip().strip('"')
-        parts = _parse_multipart(self._read_body(), boundary)
+        body = self._read_body()
+        if body is None:
+            return  # 413 already sent
+        parts = _parse_multipart(body, boundary)
         fields: dict[str, str] = {}
         ref_parts: list[dict] = []
         try:
@@ -549,6 +614,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(400, f"bad image upload: {e}")
         if not ref_parts:
             return self._send_error(400, "at least one `image` file part is required")
+        if len(ref_parts) > MAX_REF_IMAGES:
+            return self._send_error(400, f"too many image parts (max {MAX_REF_IMAGES})")
         self._common(ref_parts=ref_parts, **_extract_params(fields))
 
 
