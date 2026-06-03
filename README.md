@@ -31,6 +31,21 @@
 - 已安装 [Codex CLI](https://github.com/openai/codex) 并完成登录（`codex login`），即存在 `~/.codex/auth.json`。
 - Python 3.10+（开发环境为 3.14）。
 
+## 安装为 Claude Code 插件（推荐）
+
+本仓库本身就是一个 Claude Code 插件 + 市场。装上后即获得两个 skill——`generate-image`（生图/改图）与 `connect-api`（把现有项目切到本地 API）——后端 server 由 skill **按需自启**，无需手动管理。
+
+在 Claude Code 里执行：
+
+```bash
+/plugin marketplace add michaelyufeng/codex-image-api
+/plugin install codex-image-api@codex-image-api
+```
+
+装好后直接说「画一张赛博朋克风格的猫」即可触发生图；说「把这个项目接入本地生图 API」即可触发接入。skill 脚本用 `${CLAUDE_PLUGIN_ROOT}` 定位插件内的 server，**不依赖任何硬编码路径**。
+
+> 只想要 HTTP API、不需要 skill？跳过本节，直接看下面用 `./run.sh` 起服务。
+
 ## 启动
 
 ```bash
@@ -112,13 +127,18 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 ## 项目结构
 
 ```
+.claude-plugin/      插件 + 市场清单（plugin.json / marketplace.json）
+skills/              捆绑的两个 skill：generate-image（生图）、connect-api（接入）
 server.py            HTTP 服务：OpenAI 兼容路由 + 上游 Responses 调用 + SSE 解析 + token 刷新
 _codex_auth.py       auth.json 发现 + JWT 解码（零副作用），被 server.py 与 lib_preflight.py 共用
-lib_preflight.py     生图 skill 的前置检查：Codex 登录态探测 + 服务自启（自启逻辑唯一来源）
-run.sh               控制脚本：前台 / 后台(bg) / 安装开机自启(install-launchd)
+lib_preflight.py     skill 的前置检查：Codex 登录态探测 + 服务自启（自启逻辑唯一来源）
+run.sh               控制脚本：前台 / 后台(bg) / 停止(stop) / 安装开机自启(install-launchd)
 deploy/*.plist       macOS LaunchAgent 模板（安装时填充真实路径）
 examples/            curl + Python(OpenAI SDK) 调用示例
 ```
+
+> skill 脚本（`skills/*/`）通过 `__file__` 相对定位本仓库根的 `lib_preflight.py`/`server.py`，
+> 因此无论插件被安装到哪里都能找到后端；`CODEX_IMAGE_SERVER_DIR` 可覆盖指向另一处源码。
 
 ## 已知限制
 
