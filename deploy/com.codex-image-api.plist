@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent for codex-image-api.
+
+  Install: run `./run.sh install-launchd` from the project root. It fills the
+  __PYTHON__ / __SERVER_DIR__ placeholders below with your machine's real paths,
+  writes the result into ~/Library/LaunchAgents/, and loads it.
+  Uninstall:
+       launchctl unload ~/Library/LaunchAgents/com.codex-image-api.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.codex-image-api</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__SERVER_DIR__/server.py</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/codex-image-api.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/codex-image-api.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
