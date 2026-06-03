@@ -18,14 +18,16 @@ case "${1:-}" in
     echo "stop with: ./run.sh stop"
     ;;
   stop)
+    # Prefer the pidfile (written by `bg`). The skill auto-start uses Popen with
+    # no pidfile and the process shows as `.../python <abs>/server.py` (NOT
+    # `python3 server.py`), so fall back to matching server.py. launchd-managed
+    # instances: `launchctl unload ~/Library/LaunchAgents/com.codex-image-api.plist`.
     if [[ -f "$PIDFILE" ]] && kill "$(cat "$PIDFILE")" 2>/dev/null; then
       echo "stopped (pid $(cat "$PIDFILE"))."
+    elif pkill -f 'server\.py'; then
+      echo "stopped (matched server.py)."
     else
-      # The process shows up as `.../Python server.py`, NOT `python3 server.py`,
-      # so a pattern fallback must match on server.py. launchd-managed instances:
-      # stop with `launchctl unload ~/Library/LaunchAgents/com.codex-image-api.plist`.
-      echo "no tracked background server (pidfile: $PIDFILE)." >&2
-      echo "if started another way, stop with: pkill -f 'server\\.py'" >&2
+      echo "no running codex-image-api server found." >&2
     fi
     rm -f "$PIDFILE"
     ;;
