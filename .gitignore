@@ -6,3 +6,8 @@ generated/
 
 # Local Claude Code project notes — kept on disk, not published
 CLAUDE.md
+
+# Defense-in-depth: never publish env files or OAuth credentials
+.env
+.env.*
+auth.json
