@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Subscription-backed local image API + skills for Claude Code.",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "codex-image-api",
       "description": "Local OpenAI-compatible image API on your ChatGPT/Codex subscription, with generate-image and connect-api skills.",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "author": {
         "name": "michaelyufeng"
       },

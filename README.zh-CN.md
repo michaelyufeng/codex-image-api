@@ -57,7 +57,8 @@ python3 server.py
 
 ```bash
 curl http://127.0.0.1:10532/health
-# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3, "version": "0.3"}
+# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3,
+#  "active": 0, "queued": 0, "uptime_s": 42, "version": "0.4"}
 ```
 
 ## 在你的项目里使用（改一行）
@@ -90,7 +91,7 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 | `GET`  | `/health` | 服务与 token 状态 |
 | `GET`  | `/v1/models` | 模型列表 |
 
-### 请求参数（generations）
+### 请求参数（generations 与 edits 通用）
 
 | 字段 | 默认 | 可选值 |
 |---|---|---|
@@ -99,7 +100,14 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 | `quality` | `high` | `low` / `medium` / `high` / `auto` |
 | `n` | `1` | `1`–`8` |
 | `response_format` | `b64_json` | `b64_json` / `url` |
+| `output_format` | *（不传 → png）* | `png` / `jpeg` / `webp` |
+| `output_compression` | *（不传）* | 整数 `0`–`100`（仅 jpeg/webp 生效） |
+| `background` | *（不传）* | 会透传，但上游 `gpt-image-2-codex` 目前**拒绝** `transparent`（实测） |
+| `input_fidelity` | *（不传）* | 会透传，但上游 `gpt-image-2-codex` 目前**拒绝**该参数（实测） |
+| `moderation` | `low` | `low` / `auto` |
 | `reference_images` | `[]` | 数组，元素为本地路径 / http(s) URL / `data:` URL / `{"data","mime"}`（图生图扩展） |
+
+可选字段只在显式传入时才转发上游，老调用行为完全不变。批量（`n>1`）部分失败时，返回成功的图片并附 `warnings` 数组，不再整单报废。
 
 ## 配置（环境变量）
 
@@ -116,6 +124,16 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 | `CODEX_IMAGE_ALLOWED_HOSTS` | *（自动）* | 额外放行的 `Host` 头（逗号分隔）；默认仅放行 localhost，挡 DNS rebinding |
 | `CODEX_IMAGE_MAX_BODY` | `67108864` | 单次请求体上限（字节，超出返回 413） |
 | `CODEX_IMAGE_MAX_REFS` | `16` | 单次请求 `reference_images` / 上传图片数量上限 |
+| `CODEX_IMAGE_TIMEOUT` | `400` | 单次上游生成的 socket 超时（秒） |
+| `CODEX_IMAGE_RETRIES` | `2` | 上游瞬时故障（断流、401/429/5xx、空结果）的额外重试次数 |
+
+## 稳定性说明
+
+- **客户端超时要给足。** `quality=high` 单张 1–3 分钟；`n>1` 还要按 `CODEX_IMAGE_CONCURRENCY` 分批排队。客户端超时比服务端短就会看到请求"断线"——其实服务端还在干活（日志会出现 `client disconnected before the response could be sent`）。用 OpenAI SDK 时：`OpenAI(base_url=..., api_key="unused", timeout=600)`。
+- **内置重试。** 上游 SSE 断流、401（自动换新 token）、429/5xx、空结果都会按退避自动重试，重试用尽才报错。
+- **客户端挂了就停手。** 调用方在排队或重试间隙挂断时，服务端会放弃该任务，不再白烧订阅额度。
+- **同端口只留一个实例。** launchd KeepAlive、skill 自启、`./run.sh` 可能抢同一端口；现在抢输的一方安静退出，不再 `Address already in use` 崩溃循环刷日志。
+- `GET /health` 新增 `active` / `queued`（在产/排队中的生成数）与 `uptime_s`，便于排查。
 
 ## 项目结构
 

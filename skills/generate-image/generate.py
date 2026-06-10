@@ -32,14 +32,14 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def _do(req: urllib.request.Request) -> dict:
+def _do(req: urllib.request.Request, timeout: int = 480) -> dict:
     """Issue the request; turn server 4xx/5xx and network errors into a clean
     fatal message instead of an uncaught traceback. The server always pairs an
     error with an HTTP error status (403/413/400/502...), so urlopen raises
     HTTPError rather than returning an {"error": ...} body — that's the real
     error channel we must handle here."""
     try:
-        with urllib.request.urlopen(req, timeout=420) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
@@ -52,14 +52,15 @@ def _do(req: urllib.request.Request) -> dict:
         sys.exit(f"生成失败: 无法连接本地 API（{e.reason}）；详见 /tmp/codex-image-api.log")
 
 
-def _post_json(path: str, payload: dict) -> dict:
+def _post_json(path: str, payload: dict, timeout: int) -> dict:
     req = urllib.request.Request(
         API + path, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
-    return _do(req)
+    return _do(req, timeout)
 
 
-def _post_multipart(path: str, fields: dict, files: list[tuple[str, str]]) -> dict:
+def _post_multipart(path: str, fields: dict, files: list[tuple[str, str]],
+                    timeout: int) -> dict:
     boundary = "----codeximg" + str(int(time.time() * 1000))
     body = b""
     for k, v in fields.items():
@@ -76,7 +77,7 @@ def _post_multipart(path: str, fields: dict, files: list[tuple[str, str]]) -> di
     req = urllib.request.Request(
         API + path, data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
-    return _do(req)
+    return _do(req, timeout)
 
 
 def main() -> None:
@@ -85,33 +86,57 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Generate or edit images via codex-image-api")
     ap.add_argument("prompt", help="image description")
     ap.add_argument("-i", "--image", action="append", default=[], help="reference image(s) -> edit")
-    ap.add_argument("-s", "--size", default="1024x1024")
-    ap.add_argument("-q", "--quality", default="high")
+    ap.add_argument("-s", "--size", default="1024x1024",
+                    choices=["1024x1024", "1024x1536", "1536x1024", "auto"])
+    ap.add_argument("-q", "--quality", default="high",
+                    choices=["low", "medium", "high", "auto"])
     ap.add_argument("-n", "--count", type=int, default=1)
     ap.add_argument("-o", "--out", help="output path (default ./image-<ts>.png)")
+    # NOTE: upstream gpt-image-2-codex currently rejects `background=transparent`
+    # and `input_fidelity`, so those are deliberately NOT exposed here. The
+    # server still passes them through for clients that want to probe support.
+    ap.add_argument("--format", dest="output_format", choices=["png", "jpeg", "webp"],
+                    help="output image format (default png)")
+    ap.add_argument("--compression", type=int,
+                    help="jpeg/webp compression level 0-100")
+    ap.add_argument("--timeout", type=int,
+                    help="HTTP timeout seconds (default scales with -n)")
     a = ap.parse_args()
 
     preflight.ensure_server_running()                       # 统一自启（共享逻辑）
     _log(f"生成中（{'图生图' if a.image else '文生图'}, quality={a.quality}, n={a.count}）…")
 
+    # high 质量单张可达 2-3 分钟；n 张按服务端并发 3 分批 → 超时按批数放大。
+    timeout = a.timeout or (480 * -(-a.count // 3))
+
+    extra = {k: v for k, v in {
+        "output_format": a.output_format,
+        "output_compression": a.compression,
+    }.items() if v is not None}
+
     if a.image:
         for p in a.image:
             if not os.path.isfile(p):
                 sys.exit(f"参考图不存在: {p}")
-        resp = _post_multipart("/v1/images/edits",
-                               {"prompt": a.prompt, "size": a.size,
-                                "quality": a.quality, "n": str(a.count)},
-                               [("image", p) for p in a.image])
+        fields = {"prompt": a.prompt, "size": a.size,
+                  "quality": a.quality, "n": str(a.count)}
+        fields.update({k: str(v) for k, v in extra.items()})
+        resp = _post_multipart("/v1/images/edits", fields,
+                               [("image", p) for p in a.image], timeout)
     else:
-        resp = _post_json("/v1/images/generations",
-                          {"prompt": a.prompt, "size": a.size,
-                           "quality": a.quality, "n": a.count})
+        payload = {"prompt": a.prompt, "size": a.size,
+                   "quality": a.quality, "n": a.count}
+        payload.update(extra)
+        resp = _post_json("/v1/images/generations", payload, timeout)
 
+    for w in resp.get("warnings") or []:
+        _log(f"⚠️  {w}")
     data = resp.get("data") or []
+    ext = {"jpeg": ".jpg", "webp": ".webp"}.get(a.output_format or "png", ".png")
     stem = (a.out.rsplit(".", 1)[0] if a.out else f"image-{int(time.time())}")
     for i, item in enumerate(data):
         out = (a.out if (a.out and len(data) == 1)
-               else f"{stem}.png" if len(data) == 1 else f"{stem}-{i + 1}.png")
+               else f"{stem}{ext}" if len(data) == 1 else f"{stem}-{i + 1}{ext}")
         Path(out).write_bytes(base64.b64decode(item["b64_json"]))
         print(os.path.abspath(out))  # stdout: one path per line
 

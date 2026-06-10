@@ -57,7 +57,8 @@ Listens on `http://127.0.0.1:10532` by default. Health check:
 
 ```bash
 curl http://127.0.0.1:10532/health
-# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3, "version": "0.3"}
+# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3,
+#  "active": 0, "queued": 0, "uptime_s": 42, "version": "0.4"}
 ```
 
 ## Use in your project (change one line)
@@ -90,7 +91,7 @@ More in [`examples/`](./examples/).
 | `GET`  | `/health` | service + token status |
 | `GET`  | `/v1/models` | model list |
 
-### Request parameters (generations)
+### Request parameters (generations & edits)
 
 | Field | Default | Allowed |
 |---|---|---|
@@ -99,7 +100,14 @@ More in [`examples/`](./examples/).
 | `quality` | `high` | `low` / `medium` / `high` / `auto` |
 | `n` | `1` | `1`–`8` |
 | `response_format` | `b64_json` | `b64_json` / `url` |
+| `output_format` | *(unset → png)* | `png` / `jpeg` / `webp` |
+| `output_compression` | *(unset)* | integer `0`–`100` (jpeg/webp only) |
+| `background` | *(unset)* | passed through, but upstream `gpt-image-2-codex` currently **rejects** `transparent` |
+| `input_fidelity` | *(unset)* | passed through, but upstream `gpt-image-2-codex` currently **rejects** it |
+| `moderation` | `low` | `low` / `auto` |
 | `reference_images` | `[]` | array of local path / http(s) URL / `data:` URL / `{"data","mime"}` (image→image extension) |
+
+Optional fields are only forwarded upstream when you set them, so existing calls behave exactly as before. If a batch (`n>1`) partially fails, the response carries the successful images plus a `warnings` array instead of failing wholesale.
 
 ## Configuration (environment variables)
 
@@ -116,6 +124,16 @@ More in [`examples/`](./examples/).
 | `CODEX_IMAGE_ALLOWED_HOSTS` | *(auto)* | extra allowed `Host` headers (comma-separated); only localhost by default — blocks DNS rebinding |
 | `CODEX_IMAGE_MAX_BODY` | `67108864` | max request body in bytes (returns 413 if exceeded) |
 | `CODEX_IMAGE_MAX_REFS` | `16` | max `reference_images` / uploaded images per request |
+| `CODEX_IMAGE_TIMEOUT` | `400` | upstream socket timeout per generation attempt (seconds) |
+| `CODEX_IMAGE_RETRIES` | `2` | extra attempts on transient upstream failures (network drop, 401/429/5xx, empty result) |
+
+## Reliability notes
+
+- **Set a generous client-side timeout.** `quality=high` takes 1–3 min per image; with `n>1` batches queue through `CODEX_IMAGE_CONCURRENCY` slots. If your HTTP client times out first you'll see the request "drop" while the server finishes (and logs `client disconnected before the response could be sent`). With the OpenAI SDK: `OpenAI(base_url=..., api_key="unused", timeout=600)`.
+- **Retries are built in.** Transient upstream failures (SSE stream cut, 401 → token re-mint, 429/5xx, empty result) are retried with backoff before the request fails.
+- **Disconnected clients stop burning quota.** If the caller hangs up while its job is queued or between retries, the server aborts that work.
+- **One instance per port.** launchd KeepAlive, skill auto-start and `./run.sh` can race; the loser now exits cleanly instead of crash-looping on `Address already in use`.
+- `GET /health` reports `active` / `queued` generation counts and `uptime_s` for quick triage.
 
 ## Project structure
 

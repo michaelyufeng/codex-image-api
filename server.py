@@ -24,10 +24,15 @@ chatgpt.com and auth.openai.com.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
+import http.client
 import json
 import os
 import re
+import select
+import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -53,13 +58,15 @@ ORCHESTRATION_MODEL = os.environ.get("CODEX_IMAGE_MODEL", "gpt-5.4-mini")
 
 TIMEOUT = int(os.environ.get("CODEX_IMAGE_TIMEOUT", "400"))
 MAX_CONCURRENCY = int(os.environ.get("CODEX_IMAGE_CONCURRENCY", "3"))
+RETRIES = int(os.environ.get("CODEX_IMAGE_RETRIES", "2"))  # extra attempts on transient upstream failure
+RETRY_BACKOFF = 3.0                                        # seconds; doubles per attempt
 MAX_N = int(os.environ.get("CODEX_IMAGE_MAX_N", "8"))
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_BODY_BYTES = int(os.environ.get("CODEX_IMAGE_MAX_BODY", str(64 * 1024 * 1024)))
 MAX_REF_IMAGES = int(os.environ.get("CODEX_IMAGE_MAX_REFS", "16"))
 
 REFRESH_MARGIN = 5 * 60       # refresh if access token expires within 5 min
-REFRESH_INTERVAL = 55 * 60    # ...or if last_refresh is older than 55 min
+REFRESH_INTERVAL = 55 * 60    # fallback (exp unreadable): refresh if last_refresh older than this
 
 IMAGE_DIR = Path(os.environ.get(
     "CODEX_IMAGE_DIR", str(Path(__file__).resolve().parent / "generated")))
@@ -97,15 +104,52 @@ DEVELOPER_PROMPT_WITH_REFS = (
 
 VALID_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
 VALID_QUALITY = {"low", "medium", "high", "auto"}
+VALID_MODERATION = {"low", "auto"}
+VALID_BACKGROUND = {"transparent", "opaque", "auto"}
+VALID_OUTPUT_FORMAT = {"png", "jpeg", "webp"}
+VALID_FIDELITY = {"low", "high"}
 
 EXT_MIME = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
 }
+FORMAT_EXT = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}
 
 _auth_lock = threading.Lock()
 _cached: dict | None = None
 _gen_sem = threading.Semaphore(MAX_CONCURRENCY)
+_started_at = time.time()
+_stats_lock = threading.Lock()
+_stats = {"active": 0, "queued": 0}
+
+
+def _stat(key: str, delta: int) -> None:
+    with _stats_lock:
+        _stats[key] += delta
+
+
+class ClientDisconnected(Exception):
+    """The HTTP client hung up while its generation was queued/running."""
+
+
+class UpstreamError(RuntimeError):
+    """Upstream replied with an HTTP error status."""
+
+    def __init__(self, code: int, detail: str, retry_after: float | None = None):
+        super().__init__(f"upstream HTTP {code}: {detail}")
+        self.code = code
+        self.retry_after = retry_after
+
+
+def _client_gone(sock) -> bool:
+    """Best-effort: True if the client already closed its side of the socket."""
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        if not readable:
+            return False           # nothing to read -> connection still open
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -170,10 +214,16 @@ def _refresh(refresh_token: str) -> dict:
 
 
 def _stale(exp: float | None, last_refresh: str | None) -> bool:
-    """True if the access token is near expiry, or last_refresh is too old."""
+    """True if the access token is near expiry.
+
+    When exp is readable, it alone decides — access tokens live for days, and
+    refreshing on a wall-clock interval would needlessly rotate the
+    refresh_token, racing Codex CLI's own copy of auth.json (a 401 source).
+    The interval check only kicks in as a fallback when exp can't be read.
+    """
     now = time.time()
-    if exp is not None and exp <= now + REFRESH_MARGIN:
-        return True
+    if exp is not None:
+        return exp <= now + REFRESH_MARGIN
     if last_refresh:
         ts = _parse_iso(last_refresh)
         if ts is not None and ts <= now - REFRESH_INTERVAL:
@@ -181,11 +231,15 @@ def _stale(exp: float | None, last_refresh: str | None) -> bool:
     return False
 
 
-def get_auth() -> dict:
-    """Return {access_token, account_id, exp}; refresh + persist if stale."""
+def get_auth(force_refresh: bool = False) -> dict:
+    """Return {access_token, account_id, exp}; refresh + persist if stale.
+
+    force_refresh: bypass the cache and rotate via refresh_token now — used
+    after an upstream 401, where the token is bad despite a future exp.
+    """
     global _cached
     with _auth_lock:
-        if _cached and not _stale(_cached["exp"], _cached["last_refresh"]):
+        if _cached and not force_refresh and not _stale(_cached["exp"], _cached["last_refresh"]):
             return _cached
 
         path, data = _read_auth_file()
@@ -196,7 +250,8 @@ def get_auth() -> dict:
         account_id = tokens.get("account_id") or _account_id_from_id_token(id_token)
         last_refresh = data.get("last_refresh")
 
-        if (not access or _stale(_codex_auth.jwt_exp(access), last_refresh)) and refresh_token:
+        if (force_refresh or not access
+                or _stale(_codex_auth.jwt_exp(access), last_refresh)) and refresh_token:
             j = _refresh(refresh_token)
             access = j.get("access_token") or access
             id_token = j.get("id_token") or id_token
@@ -284,7 +339,7 @@ def _resolve_reference(spec) -> dict:
 # Upstream call + SSE parsing + image generation (with batching/concurrency)
 # --------------------------------------------------------------------------- #
 def _build_body(prompt: str, ref_parts: list[dict], size: str,
-                quality: str, moderation: str) -> dict:
+                quality: str, moderation: str, tool_extra: dict) -> dict:
     has_refs = bool(ref_parts)
     if has_refs:
         content = list(ref_parts)
@@ -292,6 +347,9 @@ def _build_body(prompt: str, ref_parts: list[dict], size: str,
         user_msg = {"role": "user", "content": content}
     else:
         user_msg = {"role": "user", "content": f"Generate an image: {prompt}"}
+    tool = {"type": "image_generation", "quality": quality,
+            "size": size, "moderation": moderation}
+    tool.update(tool_extra)  # background / output_format / output_compression / input_fidelity
     return {
         "model": ORCHESTRATION_MODEL,
         "input": [
@@ -299,8 +357,7 @@ def _build_body(prompt: str, ref_parts: list[dict], size: str,
              "content": DEVELOPER_PROMPT_WITH_REFS if has_refs else DEVELOPER_PROMPT},
             user_msg,
         ],
-        "tools": [{"type": "image_generation", "quality": quality,
-                   "size": size, "moderation": moderation}],
+        "tools": [tool],
         "tool_choice": "auto" if has_refs else "required",
         "reasoning": {"effort": "low"},
         "stream": True,
@@ -340,8 +397,10 @@ def _iter_sse(resp):
         yield ev
 
 
-def _generate_one(prompt: str, ref_parts: list[dict], size: str,
-                  quality: str, moderation: str) -> tuple[str, str | None]:
+def _attempt_generate(prompt: str, ref_parts: list[dict], size: str, quality: str,
+                      moderation: str, tool_extra: dict) -> tuple[str, str | None]:
+    """One upstream call. Raises UpstreamError on HTTP errors, RuntimeError on
+    empty results, raw OSError/HTTPException on transport failures."""
     auth = get_auth()
     headers = {
         "Authorization": f"Bearer {auth['access_token']}",
@@ -350,11 +409,13 @@ def _generate_one(prompt: str, ref_parts: list[dict], size: str,
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
     }
-    body = json.dumps(_build_body(prompt, ref_parts, size, quality, moderation)).encode()
+    body = json.dumps(_build_body(prompt, ref_parts, size, quality,
+                                  moderation, tool_extra)).encode()
     req = Request(UPSTREAM_BASE + "/responses", data=body, headers=headers, method="POST")
     b64 = revised = None
     events = 0
-    with _gen_sem:  # cap concurrent upstream calls to avoid rate limiting
+    text_parts: list[str] = []
+    try:
         with urlopen(req, timeout=TIMEOUT) as resp:
             for ev in _iter_sse(resp):
                 events += 1
@@ -368,39 +429,115 @@ def _generate_one(prompt: str, ref_parts: list[dict], size: str,
                         rp = item.get("revised_prompt")
                         if isinstance(rp, str):
                             revised = rp
+                    elif item.get("type") == "message":
+                        for part in item.get("content") or []:
+                            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                                text_parts.append(part["text"])
                 elif t == "error":
                     raise RuntimeError(f"upstream error event: {json.dumps(ev)[:200]}")
+    except HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        try:
+            retry_after = float(e.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            retry_after = None
+        raise UpstreamError(e.code, detail, retry_after) from None
     if not b64:
-        raise RuntimeError(f"no image data after {events} stream events")
+        said = f"; assistant said: {' '.join(text_parts)[:200]}" if text_parts else ""
+        raise RuntimeError(f"no image data after {events} stream events{said}")
     return b64, revised
 
 
-def generate_images(prompt: str, ref_parts: list[dict], size: str,
-                    quality: str, moderation: str, n: int) -> list[tuple[str, str | None]]:
+def _generate_one(prompt: str, ref_parts: list[dict], size: str, quality: str,
+                  moderation: str, tool_extra: dict, alive=None) -> tuple[str, str | None]:
+    """Queue for a concurrency slot, then call upstream with retries.
+
+    Transient failures (network drop mid-SSE, 401 with token re-mint, 429/5xx,
+    empty result) are retried up to RETRIES times with backoff. `alive` is a
+    zero-arg callable polled while queued and between attempts so we stop
+    burning quota for clients that already hung up.
+    """
+    _stat("queued", 1)
+    try:
+        while not _gen_sem.acquire(timeout=2.0):  # poll so we can notice dead clients
+            if alive and not alive():
+                raise ClientDisconnected("client hung up while queued")
+    finally:
+        _stat("queued", -1)
+    _stat("active", 1)
+    try:
+        last_err: Exception = RuntimeError("unreachable")
+        for attempt in range(RETRIES + 1):
+            if alive and not alive():
+                raise ClientDisconnected("client hung up before generation finished")
+            try:
+                return _attempt_generate(prompt, ref_parts, size, quality,
+                                         moderation, tool_extra)
+            except UpstreamError as e:
+                if e.code == 401:
+                    try:
+                        get_auth(force_refresh=True)  # token bad despite future exp
+                    except Exception as re_err:
+                        print(f"[retry] token force-refresh failed: {re_err}", flush=True)
+                elif not (e.code in (408, 409, 425, 429) or e.code >= 500):
+                    raise  # 4xx other than auth/rate-limit: retrying won't help
+                last_err = e
+            except (URLError, OSError, http.client.HTTPException, RuntimeError) as e:
+                last_err = e  # transport drop / SSE cut / empty result -> retry
+            if attempt < RETRIES:
+                wait = getattr(last_err, "retry_after", None) or RETRY_BACKOFF * (2 ** attempt)
+                print(f"[retry] attempt {attempt + 1}/{RETRIES} failed "
+                      f"({str(last_err)[:160]}); retrying in {wait:.0f}s", flush=True)
+                time.sleep(wait)
+        raise last_err
+    finally:
+        _stat("active", -1)
+        _gen_sem.release()
+
+
+def generate_images(prompt: str, ref_parts: list[dict], size: str, quality: str,
+                    moderation: str, tool_extra: dict, n: int,
+                    alive=None) -> tuple[list[tuple[str, str | None]], list[Exception]]:
+    """Generate n images. Returns (successes, errors) — a batch where at least
+    one image succeeded is served rather than discarded wholesale."""
     if n <= 1:
-        return [_generate_one(prompt, ref_parts, size, quality, moderation)]
+        return [_generate_one(prompt, ref_parts, size, quality,
+                              moderation, tool_extra, alive)], []
     workers = min(n, MAX_CONCURRENCY)
+    results: list[tuple[str, str | None]] = []
+    errors: list[Exception] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_generate_one, prompt, ref_parts, size, quality, moderation)
-                for _ in range(n)]
-        return [f.result() for f in futs]
+        futs = [ex.submit(_generate_one, prompt, ref_parts, size, quality,
+                          moderation, tool_extra, alive) for _ in range(n)]
+        for f in futs:
+            try:
+                results.append(f.result())
+            except ClientDisconnected:
+                raise
+            except Exception as e:
+                errors.append(e)
+    if not results:
+        raise errors[0]
+    return results, errors
 
 
 # --------------------------------------------------------------------------- #
 # Output formatting (b64_json | url)
 # --------------------------------------------------------------------------- #
-def _save_image(b64: str) -> str:
+def _save_image(b64: str, ext: str = ".png") -> str:
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     img = base64.b64decode(b64)
-    name = f"{int(time.time())}-{hashlib.sha1(img).hexdigest()[:12]}.png"
+    name = f"{int(time.time())}-{hashlib.sha1(img).hexdigest()[:12]}{ext}"
     (IMAGE_DIR / name).write_bytes(img)
     return f"{PUBLIC_BASE}/images/{name}"
 
 
-def _to_data_items(results: list[tuple[str, str | None]], response_format: str) -> list[dict]:
+def _to_data_items(results: list[tuple[str, str | None]], response_format: str,
+                   output_format: str | None) -> list[dict]:
+    ext = FORMAT_EXT.get(output_format or "png", ".png")
     items = []
     for b64, revised in results:
-        item = {"url": _save_image(b64)} if response_format == "url" else {"b64_json": b64}
+        item = {"url": _save_image(b64, ext)} if response_format == "url" else {"b64_json": b64}
         if revised:
             item["revised_prompt"] = revised
         items.append(item)
@@ -450,6 +587,16 @@ def _coerce_n(raw) -> int:
         return -1
 
 
+def _coerce_compression(raw) -> int | None:
+    """Parse output_compression; None when absent, -1 sentinel on bad input."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _extract_params(m: dict) -> dict:
     """Pull the shared image params (with defaults) from a JSON / form mapping."""
     return {
@@ -459,6 +606,11 @@ def _extract_params(m: dict) -> dict:
         "moderation": m.get("moderation") or "low",
         "n": _coerce_n(m.get("n") or 1),
         "response_format": m.get("response_format") or "b64_json",
+        # optional passthroughs — only sent upstream when explicitly provided
+        "background": m.get("background") or None,
+        "output_format": m.get("output_format") or None,
+        "output_compression": _coerce_compression(m.get("output_compression")),
+        "input_fidelity": m.get("input_fidelity") or None,
     }
 
 
@@ -466,7 +618,7 @@ def _extract_params(m: dict) -> dict:
 # HTTP server (OpenAI-compatible surface)
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
-    server_version = "codex-image-api/0.3"
+    server_version = "codex-image-api/0.4"
     protocol_version = "HTTP/1.1"
 
     # -- helpers ---------------------------------------------------------- #
@@ -501,7 +653,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 (match base signature)
         print(f"[{self.log_date_time_string()}] {format % args}")
 
-    def _common(self, prompt, ref_parts, size, quality, moderation, n, response_format):
+    def _common(self, prompt, ref_parts, size, quality, moderation, n, response_format,
+                background=None, output_format=None, output_compression=None,
+                input_fidelity=None):
         """Shared generation + response path for generations and edits."""
         if not isinstance(prompt, str) or not prompt.strip():
             return self._send_error(400, "`prompt` is required and must be a non-empty string")
@@ -509,24 +663,68 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(400, f"invalid size {size!r}; allowed: {sorted(VALID_SIZES)}")
         if quality not in VALID_QUALITY:
             return self._send_error(400, f"invalid quality {quality!r}")
+        if moderation not in VALID_MODERATION:
+            return self._send_error(400, f"invalid moderation {moderation!r}; allowed: low/auto")
+        if background is not None and background not in VALID_BACKGROUND:
+            return self._send_error(
+                400, f"invalid background {background!r}; allowed: transparent/opaque/auto")
+        if output_format is not None and output_format not in VALID_OUTPUT_FORMAT:
+            return self._send_error(
+                400, f"invalid output_format {output_format!r}; allowed: png/jpeg/webp")
+        if output_compression is not None and not (0 <= output_compression <= 100):
+            return self._send_error(400, "`output_compression` must be an integer 0-100")
+        if input_fidelity is not None and input_fidelity not in VALID_FIDELITY:
+            return self._send_error(
+                400, f"invalid input_fidelity {input_fidelity!r}; allowed: low/high")
         if not (1 <= n <= MAX_N):
             return self._send_error(400, f"`n` must be between 1 and {MAX_N}")
         if response_format not in ("b64_json", "url"):
             return self._send_error(400, "`response_format` must be 'b64_json' or 'url'")
+
+        tool_extra = {k: v for k, v in {
+            "background": background, "output_format": output_format,
+            "output_compression": output_compression, "input_fidelity": input_fidelity,
+        }.items() if v is not None}
+
+        t0 = time.time()
+        tag = (f"quality={quality} size={size} n={n} refs={len(ref_parts)}"
+               + (f" {tool_extra}" if tool_extra else ""))
+        alive = lambda conn=self.connection: not _client_gone(conn)  # noqa: E731
         try:
-            results = generate_images(prompt, ref_parts, size, quality, moderation, n)
-        except HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:500]
-            return self._send_error(502, f"upstream HTTP {e.code}: {detail}", "upstream_error")
+            results, errors = generate_images(prompt, ref_parts, size, quality,
+                                              moderation, tool_extra, n, alive)
+        except ClientDisconnected as e:
+            self.close_connection = True
+            print(f"[gen] aborted after {time.time() - t0:.1f}s ({tag}): {e} — "
+                  "raise the client-side timeout if this was not intentional", flush=True)
+            return
+        except UpstreamError as e:
+            print(f"[gen] failed after {time.time() - t0:.1f}s ({tag}): {e}", flush=True)
+            return self._send_error(502, str(e), "upstream_error")
         except URLError as e:
+            print(f"[gen] failed after {time.time() - t0:.1f}s ({tag}): {e}", flush=True)
             return self._send_error(502, f"network error: {e.reason}", "upstream_error")
         except Exception as e:
+            print(f"[gen] failed after {time.time() - t0:.1f}s ({tag}): {e}", flush=True)
             return self._send_error(502, f"generation failed: {e}", "upstream_error")
-        self._send_json(200, {
+
+        out = {
             "created": int(time.time()),
-            "data": _to_data_items(results, response_format),
+            "data": _to_data_items(results, response_format, output_format),
             "usage": {},
-        })
+        }
+        if errors:  # partial batch: serve what succeeded, surface the rest
+            out["warnings"] = [f"{len(errors)}/{n} generations failed: "
+                               + "; ".join(str(e)[:160] for e in errors[:3])]
+        elapsed = time.time() - t0
+        print(f"[gen] ok {len(results)}/{n} in {elapsed:.1f}s ({tag})", flush=True)
+        try:
+            self._send_json(200, out)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+            print(f"[gen] client disconnected before the response could be sent "
+                  f"(generation took {elapsed:.1f}s — raise the client-side timeout)",
+                  flush=True)
 
     # -- routes ----------------------------------------------------------- #
     def do_GET(self):
@@ -537,9 +735,14 @@ class Handler(BaseHTTPRequestHandler):
                 a = get_auth()
                 exp = a.get("exp")
                 detail = f"expires in {int(exp - time.time())}s" if exp else "loaded"
+                with _stats_lock:
+                    active, queued = _stats["active"], _stats["queued"]
                 self._send_json(200, {"ok": True, "auth": detail,
                                       "model": ORCHESTRATION_MODEL,
-                                      "concurrency": MAX_CONCURRENCY, "version": "0.3"})
+                                      "concurrency": MAX_CONCURRENCY,
+                                      "active": active, "queued": queued,
+                                      "uptime_s": int(time.time() - _started_at),
+                                      "version": "0.4"})
             except Exception as e:
                 self._send_json(200, {"ok": False, "auth": str(e)})
             return
@@ -559,7 +762,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(404, "image not found", "not_found")
         data = fpath.read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Type", EXT_MIME.get(fpath.suffix.lower(), "image/png"))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -619,9 +822,35 @@ class Handler(BaseHTTPRequestHandler):
         self._common(ref_parts=ref_parts, **_extract_params(fields))
 
 
+class _Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # Clients that time out and hang up mid-generation are an expected,
+        # recoverable event — one log line, not a 30-line traceback.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            print(f"[http] client {client_address[0]}:{client_address[1]} "
+                  f"disconnected mid-request ({type(exc).__name__})", flush=True)
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"codex-image-api listening on http://{HOST}:{PORT}  (concurrency={MAX_CONCURRENCY})")
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # logs reach launchd files promptly
+    except Exception:
+        pass
+    try:
+        httpd = _Server((HOST, PORT), Handler)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            # launchd KeepAlive / skill auto-start / run.sh can race each other;
+            # losing the port to a healthy sibling is fine — bow out quietly.
+            print(f"port {PORT} already in use — another codex-image-api instance "
+                  "is probably serving; exiting.", flush=True)
+            raise SystemExit(0)
+        raise
+    print(f"codex-image-api 0.4 listening on http://{HOST}:{PORT}  "
+          f"(concurrency={MAX_CONCURRENCY}, retries={RETRIES})")
     print("  POST /v1/images/generations   text->image (JSON; n, response_format, reference_images)")
     print("  POST /v1/images/edits         image->image (multipart, OpenAI SDK compatible)")
     print("  GET  /images/<name>           serves url-mode images")
