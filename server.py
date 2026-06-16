@@ -217,7 +217,10 @@ def _account_id_from_id_token(id_token: str | None) -> str | None:
 
 def _parse_iso(s: str) -> float | None:
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:           # assume UTC for naive stamps (auth.json is shared)
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
     except Exception:
         return None
 
@@ -552,7 +555,9 @@ def _generate_one(prompt: str, ref_parts: list[dict], size: str, quality: str,
                     try:
                         get_auth(force_refresh=True)  # token bad despite future exp
                     except Exception as re_err:
-                        print(f"[retry] token force-refresh failed: {re_err}", flush=True)
+                        # can't re-mint the token → every retry would resend the
+                        # same dead token; fail fast instead of burning RETRIES.
+                        raise UpstreamError(401, f"token refresh failed: {re_err}") from None
                 elif not (e.code in (408, 409, 425, 429) or e.code >= 500):
                     raise  # 4xx other than auth/rate-limit: retrying won't help
                 last_err = e
@@ -560,6 +565,7 @@ def _generate_one(prompt: str, ref_parts: list[dict], size: str, quality: str,
                 last_err = e  # transport drop / SSE cut / empty result -> retry
             if attempt < RETRIES:
                 wait = getattr(last_err, "retry_after", None) or RETRY_BACKOFF * (2 ** attempt)
+                wait = min(wait, 60.0)  # clamp untrusted upstream Retry-After (no slot-pinning sleeps)
                 print(f"[retry] attempt {attempt + 1}/{RETRIES} failed "
                       f"({str(last_err)[:160]}); retrying in {wait:.0f}s", flush=True)
                 time.sleep(wait)
@@ -581,7 +587,8 @@ def generate_images(prompt: str, ref_parts: list[dict], size: str, quality: str,
     workers = min(n, MAX_CONCURRENCY)
     results: list[tuple[str, str | None]] = []
     errors: list[Exception] = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
         futs = [ex.submit(_generate_one, prompt, ref_parts, size, quality,
                           moderation, tool_extra, alive, effort) for _ in range(n)]
         for f in futs:
@@ -591,8 +598,14 @@ def generate_images(prompt: str, ref_parts: list[dict], size: str, quality: str,
                 raise
             except Exception as e:
                 errors.append(e)
+    finally:
+        # On bail (e.g. client disconnect) don't block on in-flight workers;
+        # cancel queued-but-unstarted futures so they stop burning quota.
+        ex.shutdown(wait=False, cancel_futures=True)
     if not results:
-        raise errors[0]
+        # surface the most informative error (an upstream HTTP error beats a
+        # transient transport blip), not just the first-submitted one.
+        raise next((e for e in errors if isinstance(e, UpstreamError)), errors[0])
     return results, errors
 
 
@@ -718,6 +731,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
+            length = -1
+        if length < 0:  # non-numeric or negative — don't let rfile.read(-1) drain to EOF
             self.close_connection = True
             self._send_error(400, "invalid Content-Length header")
             return None
@@ -824,7 +839,12 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     _, data = _read_auth_file()
                     exp = _codex_auth.jwt_exp((data.get("tokens") or {}).get("access_token"))
-                detail = f"expires in {int(exp - time.time())}s" if exp else "loaded"
+                if exp:
+                    rem = int(exp - time.time())
+                    detail = (f"expires in {rem}s" if rem > 0
+                              else f"expired {-rem}s ago; refreshes on next request")
+                else:
+                    detail = "loaded"
                 with _stats_lock:
                     active, queued = _stats["active"], _stats["queued"]
                 self._send_json(200, {"ok": True, "auth": detail,
