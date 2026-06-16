@@ -24,8 +24,8 @@ case "${1:-}" in
     # instances: `launchctl unload ~/Library/LaunchAgents/com.codex-image-api.plist`.
     if [[ -f "$PIDFILE" ]] && kill "$(cat "$PIDFILE")" 2>/dev/null; then
       echo "stopped (pid $(cat "$PIDFILE"))."
-    elif pkill -f 'server\.py'; then
-      echo "stopped (matched server.py)."
+    elif pkill -f "$PWD/server.py"; then
+      echo "stopped (matched $PWD/server.py)."
     else
       echo "no running codex-image-api server found." >&2
     fi

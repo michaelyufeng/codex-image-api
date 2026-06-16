@@ -24,16 +24,28 @@ import lib_preflight as preflight  # type: ignore  # noqa: E402
 KEY = "OPENAI_BASE_URL"
 
 
-def write_env_key(env_file: Path, key: str, val: str) -> str:
-    """Idempotently set `key=val` in a .env file, preserving comments/other lines.
+def _atomic_write(env_file: Path, text: str) -> None:
+    """Write text atomically (tmp + os.replace), preserving the file's mode —
+    same standard the project uses for auth.json; never truncate the user's .env."""
+    tmp = env_file.with_name(env_file.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8", newline="")  # keep \r\n / \n exactly as given
+    if env_file.exists():
+        try:
+            os.chmod(tmp, env_file.stat().st_mode & 0o777)
+        except OSError:
+            pass
+    os.replace(tmp, env_file)
 
-    Returns one of: "created" | "updated" | "skipped".
-    """
+
+def write_env_key(env_file: Path, key: str, val: str) -> str:
+    """Idempotently set `key=val` in a .env file, preserving comments/other lines
+    and the file's existing newline style. Returns "created"|"updated"|"skipped"."""
     line = f"{key}={val}"
     if not env_file.exists():
-        env_file.write_text(line + "\n", encoding="utf-8")
+        _atomic_write(env_file, line + "\n")
         return "created"
-    text = env_file.read_text(encoding="utf-8")
+    text = env_file.read_text(encoding="utf-8", newline="")  # newline="" -> keep \r\n as-is
+    nl = "\r\n" if "\r\n" in text else "\n"   # preserve the file's newline style
     lines = text.splitlines()
     pat = re.compile(rf"^\s*(export\s+)?{re.escape(key)}\s*=")
     for i, ln in enumerate(lines):
@@ -41,10 +53,10 @@ def write_env_key(env_file: Path, key: str, val: str) -> str:
             if ln.strip() == line:
                 return "skipped"
             lines[i] = line
-            env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            _atomic_write(env_file, nl.join(lines) + nl)
             return "updated"
-    sep = "" if (text == "" or text.endswith("\n")) else "\n"
-    env_file.write_text(text + sep + line + "\n", encoding="utf-8")
+    sep = "" if (text == "" or text.endswith(("\n", "\r"))) else nl
+    _atomic_write(env_file, text + sep + line + nl)
     return "updated"
 
 

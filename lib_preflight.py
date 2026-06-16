@@ -148,8 +148,11 @@ def ensure_server_running(install_launchd: bool = False, wait_seconds: int = 15)
             sys.exit(f"server.py not found at {server!r}; set CODEX_IMAGE_SERVER_DIR")
         _log("codex-image-api 未在线，正在自动启动…")
         log = open("/tmp/codex-image-api.log", "a")
-        subprocess.Popen([sys.executable, server], cwd=SERVER_DIR,
-                         stdout=log, stderr=log, start_new_session=True)
+        try:
+            subprocess.Popen([sys.executable, server], cwd=SERVER_DIR,
+                             stdout=log, stderr=log, start_new_session=True)
+        finally:
+            log.close()  # child inherited the fd; don't leak it in the parent
 
     for _ in range(wait_seconds * 2):  # poll every 0.5s
         if _server_online():
@@ -169,9 +172,12 @@ def _install_launchd_plist() -> None:
         return
     try:
         # Fill the template's placeholders with this machine's real paths.
+        # escape XML metachars so a path with & < > can't corrupt the plist
+        def _xml(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         content = (src.read_text(encoding="utf-8")
-                   .replace("__PYTHON__", sys.executable)
-                   .replace("__SERVER_DIR__", SERVER_DIR))
+                   .replace("__PYTHON__", _xml(sys.executable))
+                   .replace("__SERVER_DIR__", _xml(SERVER_DIR)))
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(content, encoding="utf-8")
         _log(f"已安装 LaunchAgent → {dst}")
