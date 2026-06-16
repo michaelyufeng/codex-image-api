@@ -57,8 +57,8 @@ python3 server.py
 
 ```bash
 curl http://127.0.0.1:10532/health
-# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3,
-#  "active": 0, "queued": 0, "uptime_s": 42, "version": "0.4"}
+# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.5", "concurrency": 3,
+#  "active": 0, "queued": 0, "uptime_s": 42, "version": "0.5.0"}
 ```
 
 ## 在你的项目里使用（改一行）
@@ -105,9 +105,10 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 | `background` | *（不传）* | 会透传，但上游 `gpt-image-2-codex` 目前**拒绝** `transparent`（实测） |
 | `input_fidelity` | *（不传）* | 会透传，但上游 `gpt-image-2-codex` 目前**拒绝**该参数（实测） |
 | `moderation` | `low` | `low` / `auto` |
+| `effort` | `medium` | `low`（快档，prompt 原样透传）/ `medium`（默认——先思考、把你的意图扩写成摄影 brief 再画）/ `high`（最深思考）。非 `low` 即"深度模式"，明显更真实但慢 ~2–4× |
 | `reference_images` | `[]` | 数组，元素为本地路径 / http(s) URL / `data:` URL / `{"data","mime"}`（图生图扩展） |
 
-可选字段只在显式传入时才转发上游，老调用行为完全不变。批量（`n>1`）部分失败时，返回成功的图片并附 `warnings` 数组，不再整单报废。
+可选透传字段（`background`、`output_format` 等）只在显式传入时才转发上游。注意 `effort` 现在默认 `medium`（深度模式）——不传它的调用会得到更精细但更慢的结果、且 prompt 会被自动扩写；要恢复旧的快档透传请显式传 `effort=low`。批量（`n>1`）部分失败时，返回成功的图片并附 `warnings` 数组，不再整单报废。
 
 ## 配置（环境变量）
 
@@ -115,7 +116,7 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 |---|---|---|
 | `CODEX_IMAGE_HOST` | `127.0.0.1` | 监听地址 |
 | `CODEX_IMAGE_PORT` | `10532` | 监听端口 |
-| `CODEX_IMAGE_MODEL` | `gpt-5.4-mini` | 驱动 image_generation 工具的编排模型 |
+| `CODEX_IMAGE_MODEL` | `gpt-5.5` | 驱动 image_generation 工具的编排模型 |
 | `CODEX_IMAGE_CONCURRENCY` | `3` | 同时打到上游的最大生图数 |
 | `CODEX_IMAGE_MAX_N` | `8` | 单次请求 `n` 上限 |
 | `CODEX_IMAGE_DIR` | `./generated` | `url` 模式落盘目录 |
@@ -158,4 +159,4 @@ examples/         curl + Python(OpenAI SDK) 调用示例
 
 - 单账号并发生图由上游排队，`n>1` 实际接近串行耗时。
 - `response_format=url` 的图片落在本地 `generated/`，仅本机可访问（已被 `.gitignore` 忽略）。
-- 生图较慢（low ≈ 40s，high 更久），属于走 agent 通道的固有开销。
+- 生图较慢，且 `effort` 默认 `medium`（深度模式）：单张约 1–3 分钟；`effort=low` 才是快档（≈ 40s）。属于走 agent 通道的固有开销。

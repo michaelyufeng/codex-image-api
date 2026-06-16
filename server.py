@@ -54,7 +54,21 @@ PUBLIC_BASE = os.environ.get("CODEX_IMAGE_PUBLIC_BASE", f"http://{HOST}:{PORT}")
 UPSTREAM_BASE = "https://chatgpt.com/backend-api/codex"
 OAUTH_ISSUER = "https://auth.openai.com"
 OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Codex CLI's public client_id
-ORCHESTRATION_MODEL = os.environ.get("CODEX_IMAGE_MODEL", "gpt-5.4-mini")
+ORCHESTRATION_MODEL = os.environ.get("CODEX_IMAGE_MODEL", "gpt-5.5")
+
+
+def _plugin_version() -> str:
+    """Single source of truth for the version: read it from plugin.json so a
+    release only has to bump that one file — /health, the banner and the Server
+    header all follow automatically."""
+    try:
+        p = Path(__file__).resolve().parent / ".claude-plugin" / "plugin.json"
+        return json.loads(p.read_text(encoding="utf-8")).get("version", "0")
+    except Exception:
+        return "0"
+
+
+__version__ = _plugin_version()
 
 TIMEOUT = int(os.environ.get("CODEX_IMAGE_TIMEOUT", "400"))
 MAX_CONCURRENCY = int(os.environ.get("CODEX_IMAGE_CONCURRENCY", "3"))
@@ -102,12 +116,38 @@ DEVELOPER_PROMPT_WITH_REFS = (
     "with the references. Render at maximum technical quality. Do not add disclaimers."
 )
 
+# Deep mode (reasoning.effort != "low"): let the model think first and expand a
+# SHORT user intent into a precise photographic brief before drawing. Trades
+# ~3-4x latency for markedly more realistic, less "AI-looking" output. Kept
+# general on purpose — project-specific direction (composition, palette, mood)
+# is supplied by the caller's prompt, not baked in here.
+DEVELOPER_PROMPT_DEEP = (
+    "You are a senior photography art director and the image engine. Think "
+    "carefully before generating: the user gives a SHORT intent — silently expand "
+    "it into a precise photographic brief, then invoke the image_generation tool "
+    "exactly once. Before rendering, lock down (1) lighting: natural directional "
+    "light with soft falloff, never flat AI lighting; (2) lens & framing: a "
+    "concrete focal length, camera height and crop; (3) skin/material: real "
+    "visible texture and a warm natural tone, no plastic beauty-smoothing — warm "
+    "reads as a real photo, cold 'clean' tones read as AI; (4) composition and "
+    "pose. Express everything as CONCRETE POSITIVE description — the renderer "
+    "ignores abstract negations like 'not blurry', so state the positive look "
+    "instead. Render at maximum technical quality. No disclaimers, and no text "
+    "overlays unless the user explicitly asks for them."
+)
+DEVELOPER_PROMPT_DEEP_WITH_REFS = (
+    "The user provided one or more reference images. Inspect them first and "
+    "preserve the identity, the garment's color/cut/print, and the scene "
+    "faithfully; do not invent products. " + DEVELOPER_PROMPT_DEEP
+)
+
 VALID_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
 VALID_QUALITY = {"low", "medium", "high", "auto"}
 VALID_MODERATION = {"low", "auto"}
 VALID_BACKGROUND = {"transparent", "opaque", "auto"}
 VALID_OUTPUT_FORMAT = {"png", "jpeg", "webp"}
 VALID_FIDELITY = {"low", "high"}
+VALID_EFFORT = {"low", "medium", "high"}
 
 EXT_MIME = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -339,8 +379,10 @@ def _resolve_reference(spec) -> dict:
 # Upstream call + SSE parsing + image generation (with batching/concurrency)
 # --------------------------------------------------------------------------- #
 def _build_body(prompt: str, ref_parts: list[dict], size: str,
-                quality: str, moderation: str, tool_extra: dict) -> dict:
+                quality: str, moderation: str, tool_extra: dict,
+                effort: str = "low") -> dict:
     has_refs = bool(ref_parts)
+    deep = effort != "low"   # deep: think + expand a brief before drawing
     if has_refs:
         content = list(ref_parts)
         content.append({"type": "input_text", "text": f"Generate an image: {prompt}"})
@@ -350,16 +392,20 @@ def _build_body(prompt: str, ref_parts: list[dict], size: str,
     tool = {"type": "image_generation", "quality": quality,
             "size": size, "moderation": moderation}
     tool.update(tool_extra)  # background / output_format / output_compression / input_fidelity
+    if has_refs:
+        developer = DEVELOPER_PROMPT_DEEP_WITH_REFS if deep else DEVELOPER_PROMPT_WITH_REFS
+    else:
+        developer = DEVELOPER_PROMPT_DEEP if deep else DEVELOPER_PROMPT
     return {
         "model": ORCHESTRATION_MODEL,
         "input": [
-            {"role": "developer",
-             "content": DEVELOPER_PROMPT_WITH_REFS if has_refs else DEVELOPER_PROMPT},
+            {"role": "developer", "content": developer},
             user_msg,
         ],
         "tools": [tool],
-        "tool_choice": "auto" if has_refs else "required",
-        "reasoning": {"effort": "low"},
+        # force the tool in deep mode too, else effort=high may "think but not draw"
+        "tool_choice": "required" if (deep or not has_refs) else "auto",
+        "reasoning": {"effort": effort},
         "stream": True,
         "store": False,
         "instructions": "",
@@ -398,7 +444,8 @@ def _iter_sse(resp):
 
 
 def _attempt_generate(prompt: str, ref_parts: list[dict], size: str, quality: str,
-                      moderation: str, tool_extra: dict) -> tuple[str, str | None]:
+                      moderation: str, tool_extra: dict,
+                      effort: str = "low") -> tuple[str, str | None]:
     """One upstream call. Raises UpstreamError on HTTP errors, RuntimeError on
     empty results, raw OSError/HTTPException on transport failures."""
     auth = get_auth()
@@ -410,13 +457,15 @@ def _attempt_generate(prompt: str, ref_parts: list[dict], size: str, quality: st
         "Accept": "text/event-stream",
     }
     body = json.dumps(_build_body(prompt, ref_parts, size, quality,
-                                  moderation, tool_extra)).encode()
+                                  moderation, tool_extra, effort)).encode()
     req = Request(UPSTREAM_BASE + "/responses", data=body, headers=headers, method="POST")
     b64 = revised = None
     events = 0
     text_parts: list[str] = []
+    # deep (effort != low) thinks + expands → needs longer than the low fast path
+    to = max(TIMEOUT, 720) if effort != "low" else TIMEOUT
     try:
-        with urlopen(req, timeout=TIMEOUT) as resp:
+        with urlopen(req, timeout=to) as resp:
             for ev in _iter_sse(resp):
                 events += 1
                 t = ev.get("type")
@@ -449,7 +498,8 @@ def _attempt_generate(prompt: str, ref_parts: list[dict], size: str, quality: st
 
 
 def _generate_one(prompt: str, ref_parts: list[dict], size: str, quality: str,
-                  moderation: str, tool_extra: dict, alive=None) -> tuple[str, str | None]:
+                  moderation: str, tool_extra: dict, alive=None,
+                  effort: str = "low") -> tuple[str, str | None]:
     """Queue for a concurrency slot, then call upstream with retries.
 
     Transient failures (network drop mid-SSE, 401 with token re-mint, 429/5xx,
@@ -472,7 +522,7 @@ def _generate_one(prompt: str, ref_parts: list[dict], size: str, quality: str,
                 raise ClientDisconnected("client hung up before generation finished")
             try:
                 return _attempt_generate(prompt, ref_parts, size, quality,
-                                         moderation, tool_extra)
+                                         moderation, tool_extra, effort)
             except UpstreamError as e:
                 if e.code == 401:
                     try:
@@ -497,18 +547,19 @@ def _generate_one(prompt: str, ref_parts: list[dict], size: str, quality: str,
 
 def generate_images(prompt: str, ref_parts: list[dict], size: str, quality: str,
                     moderation: str, tool_extra: dict, n: int,
-                    alive=None) -> tuple[list[tuple[str, str | None]], list[Exception]]:
+                    alive=None, effort: str = "low",
+                    ) -> tuple[list[tuple[str, str | None]], list[Exception]]:
     """Generate n images. Returns (successes, errors) — a batch where at least
     one image succeeded is served rather than discarded wholesale."""
     if n <= 1:
         return [_generate_one(prompt, ref_parts, size, quality,
-                              moderation, tool_extra, alive)], []
+                              moderation, tool_extra, alive, effort)], []
     workers = min(n, MAX_CONCURRENCY)
     results: list[tuple[str, str | None]] = []
     errors: list[Exception] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(_generate_one, prompt, ref_parts, size, quality,
-                          moderation, tool_extra, alive) for _ in range(n)]
+                          moderation, tool_extra, alive, effort) for _ in range(n)]
         for f in futs:
             try:
                 results.append(f.result())
@@ -606,6 +657,9 @@ def _extract_params(m: dict) -> dict:
         "moderation": m.get("moderation") or "low",
         "n": _coerce_n(m.get("n") or 1),
         "response_format": m.get("response_format") or "b64_json",
+        # default deep: callers that don't pass effort still get think+expand
+        # (pass effort="low" explicitly for the fast passthrough path)
+        "effort": m.get("effort") or "medium",
         # optional passthroughs — only sent upstream when explicitly provided
         "background": m.get("background") or None,
         "output_format": m.get("output_format") or None,
@@ -618,7 +672,7 @@ def _extract_params(m: dict) -> dict:
 # HTTP server (OpenAI-compatible surface)
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
-    server_version = "codex-image-api/0.4"
+    server_version = f"codex-image-api/{__version__}"
     protocol_version = "HTTP/1.1"
 
     # -- helpers ---------------------------------------------------------- #
@@ -655,7 +709,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _common(self, prompt, ref_parts, size, quality, moderation, n, response_format,
                 background=None, output_format=None, output_compression=None,
-                input_fidelity=None):
+                input_fidelity=None, effort="low"):
         """Shared generation + response path for generations and edits."""
         if not isinstance(prompt, str) or not prompt.strip():
             return self._send_error(400, "`prompt` is required and must be a non-empty string")
@@ -665,6 +719,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(400, f"invalid quality {quality!r}")
         if moderation not in VALID_MODERATION:
             return self._send_error(400, f"invalid moderation {moderation!r}; allowed: low/auto")
+        if effort not in VALID_EFFORT:
+            return self._send_error(400, f"invalid effort {effort!r}; allowed: low/medium/high")
         if background is not None and background not in VALID_BACKGROUND:
             return self._send_error(
                 400, f"invalid background {background!r}; allowed: transparent/opaque/auto")
@@ -687,12 +743,12 @@ class Handler(BaseHTTPRequestHandler):
         }.items() if v is not None}
 
         t0 = time.time()
-        tag = (f"quality={quality} size={size} n={n} refs={len(ref_parts)}"
+        tag = (f"quality={quality} size={size} n={n} effort={effort} refs={len(ref_parts)}"
                + (f" {tool_extra}" if tool_extra else ""))
         alive = lambda conn=self.connection: not _client_gone(conn)  # noqa: E731
         try:
             results, errors = generate_images(prompt, ref_parts, size, quality,
-                                              moderation, tool_extra, n, alive)
+                                              moderation, tool_extra, n, alive, effort)
         except ClientDisconnected as e:
             self.close_connection = True
             print(f"[gen] aborted after {time.time() - t0:.1f}s ({tag}): {e} — "
@@ -742,7 +798,7 @@ class Handler(BaseHTTPRequestHandler):
                                       "concurrency": MAX_CONCURRENCY,
                                       "active": active, "queued": queued,
                                       "uptime_s": int(time.time() - _started_at),
-                                      "version": "0.4"})
+                                      "version": __version__})
             except Exception as e:
                 self._send_json(200, {"ok": False, "auth": str(e)})
             return
@@ -849,7 +905,7 @@ def main():
                   "is probably serving; exiting.", flush=True)
             raise SystemExit(0)
         raise
-    print(f"codex-image-api 0.4 listening on http://{HOST}:{PORT}  "
+    print(f"codex-image-api {__version__} listening on http://{HOST}:{PORT}  "
           f"(concurrency={MAX_CONCURRENCY}, retries={RETRIES})")
     print("  POST /v1/images/generations   text->image (JSON; n, response_format, reference_images)")
     print("  POST /v1/images/edits         image->image (multipart, OpenAI SDK compatible)")

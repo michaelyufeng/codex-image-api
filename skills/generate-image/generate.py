@@ -101,13 +101,20 @@ def main() -> None:
                     help="jpeg/webp compression level 0-100")
     ap.add_argument("--timeout", type=int,
                     help="HTTP timeout seconds (default scales with -n)")
+    ap.add_argument("--effort", choices=["low", "medium", "high"], default="medium",
+                    help="reasoning effort. default medium = model thinks + expands a "
+                         "photographic brief before drawing (more realistic, slower); "
+                         "high = deepest thinking; low = fast passthrough (no expansion).")
     a = ap.parse_args()
 
     preflight.ensure_server_running()                       # 统一自启（共享逻辑）
-    _log(f"生成中（{'图生图' if a.image else '文生图'}, quality={a.quality}, n={a.count}）…")
+    _log(f"生成中（{'图生图' if a.image else '文生图'}, quality={a.quality}, "
+         f"n={a.count}, effort={a.effort}）…")
 
     # high 质量单张可达 2-3 分钟；n 张按服务端并发 3 分批 → 超时按批数放大。
-    timeout = a.timeout or (480 * -(-a.count // 3))
+    # deep（effort != low）先思考再画，单批更慢 → 把每批基数也放大。
+    _per_batch = 720 if a.effort != "low" else 480
+    timeout = a.timeout or (_per_batch * -(-a.count // 3))
 
     extra = {k: v for k, v in {
         "output_format": a.output_format,
@@ -119,13 +126,13 @@ def main() -> None:
             if not os.path.isfile(p):
                 sys.exit(f"参考图不存在: {p}")
         fields = {"prompt": a.prompt, "size": a.size,
-                  "quality": a.quality, "n": str(a.count)}
+                  "quality": a.quality, "n": str(a.count), "effort": a.effort}
         fields.update({k: str(v) for k, v in extra.items()})
         resp = _post_multipart("/v1/images/edits", fields,
                                [("image", p) for p in a.image], timeout)
     else:
         payload = {"prompt": a.prompt, "size": a.size,
-                   "quality": a.quality, "n": a.count}
+                   "quality": a.quality, "n": a.count, "effort": a.effort}
         payload.update(extra)
         resp = _post_json("/v1/images/generations", payload, timeout)
 
@@ -138,6 +145,9 @@ def main() -> None:
         out = (a.out if (a.out and len(data) == 1)
                else f"{stem}{ext}" if len(data) == 1 else f"{stem}-{i + 1}{ext}")
         Path(out).write_bytes(base64.b64decode(item["b64_json"]))
+        brief = item.get("revised_prompt")
+        if a.effort != "low" and brief:    # deep: 存扩写后的摄影 brief,验证思考真生效
+            Path(out + ".brief.txt").write_text(brief, encoding="utf-8")
         print(os.path.abspath(out))  # stdout: one path per line
 
 

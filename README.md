@@ -57,8 +57,8 @@ Listens on `http://127.0.0.1:10532` by default. Health check:
 
 ```bash
 curl http://127.0.0.1:10532/health
-# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.4-mini", "concurrency": 3,
-#  "active": 0, "queued": 0, "uptime_s": 42, "version": "0.4"}
+# {"ok": true, "auth": "expires in 863239s", "model": "gpt-5.5", "concurrency": 3,
+#  "active": 0, "queued": 0, "uptime_s": 42, "version": "0.5.0"}
 ```
 
 ## Use in your project (change one line)
@@ -105,9 +105,10 @@ More in [`examples/`](./examples/).
 | `background` | *(unset)* | passed through, but upstream `gpt-image-2-codex` currently **rejects** `transparent` |
 | `input_fidelity` | *(unset)* | passed through, but upstream `gpt-image-2-codex` currently **rejects** it |
 | `moderation` | `low` | `low` / `auto` |
+| `effort` | `medium` | `low` (fast passthrough — prompt sent unchanged) / `medium` (default — model thinks first and expands your intent into a photographic brief) / `high` (deepest thinking). Anything but `low` is "deep mode": markedly more realistic, but ~2–4× slower |
 | `reference_images` | `[]` | array of local path / http(s) URL / `data:` URL / `{"data","mime"}` (image→image extension) |
 
-Optional fields are only forwarded upstream when you set them, so existing calls behave exactly as before. If a batch (`n>1`) partially fails, the response carries the successful images plus a `warnings` array instead of failing wholesale.
+Optional passthrough fields (`background`, `output_format`, …) are only forwarded upstream when you set them. Note `effort` defaults to `medium` (deep mode), so a call that doesn't set it returns a richer, slower result with an auto-expanded prompt — pass `effort="low"` for the previous fast-passthrough behavior. If a batch (`n>1`) partially fails, the response carries the successful images plus a `warnings` array instead of failing wholesale.
 
 ## Configuration (environment variables)
 
@@ -115,7 +116,7 @@ Optional fields are only forwarded upstream when you set them, so existing calls
 |---|---|---|
 | `CODEX_IMAGE_HOST` | `127.0.0.1` | listen address |
 | `CODEX_IMAGE_PORT` | `10532` | listen port |
-| `CODEX_IMAGE_MODEL` | `gpt-5.4-mini` | orchestration model driving the image_generation tool |
+| `CODEX_IMAGE_MODEL` | `gpt-5.5` | orchestration model driving the image_generation tool |
 | `CODEX_IMAGE_CONCURRENCY` | `3` | max concurrent upstream generations |
 | `CODEX_IMAGE_MAX_N` | `8` | per-request `n` cap |
 | `CODEX_IMAGE_DIR` | `./generated` | output dir for `url` mode |
@@ -158,4 +159,4 @@ See the LaunchAgent template and install notes under [`deploy/`](./deploy/).
 
 - Single-account generation is queued upstream, so `n>1` is close to serial in wall-clock time.
 - `response_format=url` images land in local `generated/` and are only reachable on this machine (gitignored).
-- Generation is slow (low ≈ 40s, high longer) — inherent overhead of going through the agent channel.
+- Generation is slow, and `effort` defaults to `medium` (deep mode): expect ~1–3 min per image. `effort=low` is the fast path (≈ 40s). Inherent overhead of going through the agent channel.
