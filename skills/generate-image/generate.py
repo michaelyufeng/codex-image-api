@@ -101,10 +101,11 @@ def main() -> None:
                     help="jpeg/webp compression level 0-100")
     ap.add_argument("--timeout", type=int,
                     help="HTTP timeout seconds (default scales with -n)")
-    ap.add_argument("--effort", choices=["low", "medium", "high"], default="medium",
-                    help="reasoning effort. default medium = model thinks + expands a "
+    ap.add_argument("--effort", choices=["low", "medium", "high"], default="low",
+                    help="reasoning effort. default low = fast passthrough (prompt sent "
+                         "as-is, no expansion); medium = model thinks + expands a "
                          "photographic brief before drawing (more realistic, slower); "
-                         "high = deepest thinking; low = fast passthrough (no expansion).")
+                         "high = deepest thinking.")
     a = ap.parse_args()
 
     preflight.ensure_server_running()                       # 统一自启（共享逻辑）

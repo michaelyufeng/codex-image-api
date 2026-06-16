@@ -696,9 +696,9 @@ def _extract_params(m: dict) -> dict:
         "moderation": m.get("moderation") or "low",
         "n": _coerce_n(m.get("n", 1)),  # absent -> 1; n=0 kept so it fails the 1..MAX_N check
         "response_format": m.get("response_format") or "b64_json",
-        # default deep: callers that don't pass effort still get think+expand
-        # (pass effort="low" explicitly for the fast passthrough path)
-        "effort": m.get("effort") or "medium",
+        # default fast passthrough: callers that don't pass effort skip think+expand
+        # (pass effort="medium"/"high" explicitly for the deep think+expand path)
+        "effort": m.get("effort") or "low",
         # optional passthroughs — only sent upstream when explicitly provided
         "background": m.get("background") or None,
         "output_format": m.get("output_format") or None,
