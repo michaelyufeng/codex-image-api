@@ -106,7 +106,7 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 | `input_fidelity` | *（不传）* | 会透传，但上游 `gpt-image-2-codex` 目前**拒绝**该参数（实测） |
 | `moderation` | `low` | `low` / `auto` |
 | `effort` | `medium` | `low`（快档，prompt 原样透传）/ `medium`（默认——先思考、把你的意图扩写成摄影 brief 再画）/ `high`（最深思考）。非 `low` 即"深度模式"，明显更真实但慢 ~2–4× |
-| `reference_images` | `[]` | 数组，元素为本地路径 / http(s) URL / `data:` URL / `{"data","mime"}`（图生图扩展） |
+| `reference_images` | `[]` | 数组，元素为本地路径 / `data:` URL / `{"data","mime"}`（图生图扩展）。`http(s)` URL 默认拒绝，需 `CODEX_IMAGE_ALLOW_REMOTE_REFS=1` 才放行（SSRF 防护） |
 
 可选透传字段（`background`、`output_format` 等）只在显式传入时才转发上游。注意 `effort` 现在默认 `medium`（深度模式）——不传它的调用会得到更精细但更慢的结果、且 prompt 会被自动扩写；要恢复旧的快档透传请显式传 `effort=low`。批量（`n>1`）部分失败时，返回成功的图片并附 `warnings` 数组，不再整单报废。
 
@@ -125,6 +125,7 @@ open("out2.png", "wb").write(base64.b64decode(r2.data[0].b64_json))
 | `CODEX_IMAGE_ALLOWED_HOSTS` | *（自动）* | 额外放行的 `Host` 头（逗号分隔）；默认仅放行 localhost，挡 DNS rebinding |
 | `CODEX_IMAGE_MAX_BODY` | `67108864` | 单次请求体上限（字节，超出返回 413） |
 | `CODEX_IMAGE_MAX_REFS` | `16` | 单次请求 `reference_images` / 上传图片数量上限 |
+| `CODEX_IMAGE_ALLOW_REMOTE_REFS` | *（关）* | 设为 `1` 放行 `http(s)` URL 参考图（会转发上游 fetch，有 SSRF 风险，默认关） |
 | `CODEX_IMAGE_TIMEOUT` | `400` | 单次上游生成的 socket 超时（秒） |
 | `CODEX_IMAGE_RETRIES` | `2` | 上游瞬时故障（断流、401/429/5xx、空结果）的额外重试次数 |
 

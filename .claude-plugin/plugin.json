@@ -1,6 +1,6 @@
 {
   "name": "codex-image-api",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Local OpenAI-compatible image API backed by your ChatGPT/Codex subscription, plus generate-image and connect-api skills. Reuse gpt-image-2 through Codex CLI's OAuth — no per-image Images API charge.",
   "author": {
     "name": "michaelyufeng"

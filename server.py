@@ -78,6 +78,9 @@ MAX_N = int(os.environ.get("CODEX_IMAGE_MAX_N", "8"))
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_BODY_BYTES = int(os.environ.get("CODEX_IMAGE_MAX_BODY", str(64 * 1024 * 1024)))
 MAX_REF_IMAGES = int(os.environ.get("CODEX_IMAGE_MAX_REFS", "16"))
+# Forwarding a caller-supplied http(s) reference URL makes the UPSTREAM fetch it
+# server-side (SSRF / confused-deputy). Off by default; opt in only for trusted callers.
+ALLOW_REMOTE_REFS = os.environ.get("CODEX_IMAGE_ALLOW_REMOTE_REFS", "").lower() in ("1", "true", "yes")
 
 REFRESH_MARGIN = 5 * 60       # refresh if access token expires within 5 min
 REFRESH_INTERVAL = 55 * 60    # fallback (exp unreadable): refresh if last_refresh older than this
@@ -161,6 +164,7 @@ _gen_sem = threading.Semaphore(MAX_CONCURRENCY)
 _started_at = time.time()
 _stats_lock = threading.Lock()
 _stats = {"active": 0, "queued": 0}
+_peek_lock = threading.Lock()  # serialize MSG_PEEK on a shared client socket
 
 
 def _stat(key: str, delta: int) -> None:
@@ -182,14 +186,20 @@ class UpstreamError(RuntimeError):
 
 
 def _client_gone(sock) -> bool:
-    """Best-effort: True if the client already closed its side of the socket."""
-    try:
-        readable, _, _ = select.select([sock], [], [], 0)
-        if not readable:
-            return False           # nothing to read -> connection still open
-        return sock.recv(1, socket.MSG_PEEK) == b""
-    except (OSError, ValueError):
-        return True
+    """Best-effort: True if the client already closed its side of the socket.
+
+    Serialized via _peek_lock: for n>1 batches the same connection socket is
+    polled from multiple worker threads, and concurrent select()+MSG_PEEK recv
+    on one socket is a data race that can spuriously report a disconnect.
+    """
+    with _peek_lock:
+        try:
+            readable, _, _ = select.select([sock], [], [], 0)
+            if not readable:
+                return False       # nothing to read -> connection still open
+            return sock.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
 
 
 # --------------------------------------------------------------------------- #
@@ -290,8 +300,9 @@ def get_auth(force_refresh: bool = False) -> dict:
         account_id = tokens.get("account_id") or _account_id_from_id_token(id_token)
         last_refresh = data.get("last_refresh")
 
-        if (force_refresh or not access
-                or _stale(_codex_auth.jwt_exp(access), last_refresh)) and refresh_token:
+        needs_refresh = (force_refresh or not access
+                         or _stale(_codex_auth.jwt_exp(access), last_refresh))
+        if needs_refresh and refresh_token:
             j = _refresh(refresh_token)
             access = j.get("access_token") or access
             id_token = j.get("id_token") or id_token
@@ -305,6 +316,10 @@ def get_auth(force_refresh: bool = False) -> dict:
             data["last_refresh"] = last_refresh
             data.setdefault("auth_mode", "chatgpt")
             _write_auth_file(path, data)
+        elif needs_refresh and not access:
+            # need a token but can't refresh (no refresh_token) and have no usable access
+            raise RuntimeError("auth.json has no usable access_token and no "
+                               "refresh_token; run `codex login` to re-authenticate")
 
         if not access:
             raise RuntimeError("no access_token available (refresh failed?)")
@@ -319,16 +334,9 @@ def get_auth(force_refresh: bool = False) -> dict:
 # --------------------------------------------------------------------------- #
 # Reference images (img->img): build `input_image` content parts
 # --------------------------------------------------------------------------- #
-def _looks_like_image(buf: bytes) -> bool:
-    """True only if buf starts with a known image magic number."""
-    return (buf[:4] == b"\x89PNG"
-            or buf[:3] == b"\xff\xd8\xff"
-            or (buf[:4] == b"RIFF" and buf[8:12] == b"WEBP")
-            or buf[:6] in (b"GIF87a", b"GIF89a")
-            or buf[:2] == b"BM")
-
-
-def _sniff_image_mime(buf: bytes) -> str:
+def _sniff_image_mime(buf: bytes) -> str | None:
+    """Image MIME from magic bytes, or None if buf isn't a recognized image.
+    Single source of truth for image detection (see _looks_like_image)."""
     if buf[:4] == b"\x89PNG":
         return "image/png"
     if buf[:3] == b"\xff\xd8\xff":
@@ -337,7 +345,14 @@ def _sniff_image_mime(buf: bytes) -> str:
         return "image/webp"
     if buf[:6] in (b"GIF87a", b"GIF89a"):
         return "image/gif"
-    return "image/png"
+    if buf[:2] == b"BM":
+        return "image/bmp"
+    return None
+
+
+def _looks_like_image(buf: bytes) -> bool:
+    """True only if buf starts with a known image magic number."""
+    return _sniff_image_mime(buf) is not None
 
 
 def _forbid_auth_dir(resolved: str) -> None:
@@ -350,7 +365,7 @@ def _forbid_auth_dir(resolved: str) -> None:
 def _image_part_from_bytes(data: bytes, mime: str | None) -> dict:
     if len(data) > MAX_UPLOAD_BYTES:
         raise ValueError(f"reference image exceeds {MAX_UPLOAD_BYTES} bytes")
-    m = mime if (mime and mime.startswith("image/")) else _sniff_image_mime(data)
+    m = mime if (mime and mime.startswith("image/")) else (_sniff_image_mime(data) or "image/png")
     b64 = base64.b64encode(data).decode()
     return {"type": "input_image", "image_url": f"data:{m};base64,{b64}"}
 
@@ -358,7 +373,14 @@ def _image_part_from_bytes(data: bytes, mime: str | None) -> dict:
 def _resolve_reference(spec) -> dict:
     """Turn a reference_images entry into an input_image content part."""
     if isinstance(spec, str):
-        if spec.startswith("data:") or spec.startswith(("http://", "https://")):
+        if spec.startswith("data:"):
+            return {"type": "input_image", "image_url": spec}
+        if spec.startswith(("http://", "https://")):
+            if not ALLOW_REMOTE_REFS:  # SSRF guard — upstream would fetch it server-side
+                raise ValueError(
+                    "remote URL reference images are disabled; set "
+                    "CODEX_IMAGE_ALLOW_REMOTE_REFS=1 to allow, or pass a local "
+                    "path / data: URL instead")
             return {"type": "input_image", "image_url": spec}  # upstream resolves
         resolved = os.path.realpath(spec)
         _forbid_auth_dir(resolved)
@@ -371,6 +393,8 @@ def _resolve_reference(spec) -> dict:
         return _image_part_from_bytes(data, EXT_MIME.get(Path(resolved).suffix.lower()))
     if isinstance(spec, dict) and spec.get("data"):
         mime = spec.get("mime", "image/png")
+        if not (isinstance(mime, str) and mime.startswith("image/")):
+            raise ValueError(f"invalid reference mime {mime!r}; must start with 'image/'")
         return {"type": "input_image", "image_url": f"data:{mime};base64,{spec['data']}"}
     raise ValueError("invalid reference_images entry (want path/url/data-url/{data,mime})")
 
@@ -599,7 +623,9 @@ def _to_data_items(results: list[tuple[str, str | None]], response_format: str,
 # multipart/form-data parsing (binary-safe, zero-dependency)
 # --------------------------------------------------------------------------- #
 def _disp_param(disp: str, key: str) -> str | None:
-    m = re.search(rf'{key}="([^"]*)"', disp)
+    # anchor on a param boundary (start or ";") so searching for `name` doesn't
+    # match the `name="..."` substring inside `filename="..."`.
+    m = re.search(rf'(?:^|;)\s*{re.escape(key)}="([^"]*)"', disp)
     return m.group(1) if m else None
 
 
@@ -655,7 +681,7 @@ def _extract_params(m: dict) -> dict:
         "size": m.get("size") or "1024x1024",
         "quality": m.get("quality") or "high",
         "moderation": m.get("moderation") or "low",
-        "n": _coerce_n(m.get("n") or 1),
+        "n": _coerce_n(m.get("n", 1)),  # absent -> 1; n=0 kept so it fails the 1..MAX_N check
         "response_format": m.get("response_format") or "b64_json",
         # default deep: callers that don't pass effort still get think+expand
         # (pass effort="low" explicitly for the fast passthrough path)
@@ -688,8 +714,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(code, {"error": {"message": msg, "type": typ}})
 
     def _read_body(self) -> bytes | None:
-        """Read the body, or send 413 + return None if it exceeds the cap."""
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        """Read the body; send 400/413 + return None on bad/oversized length."""
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.close_connection = True
+            self._send_error(400, "invalid Content-Length header")
+            return None
         if length > MAX_BODY_BYTES:
             self.close_connection = True  # don't desync the keep-alive stream
             self._send_error(413, f"request body exceeds {MAX_BODY_BYTES} bytes",
@@ -700,9 +731,7 @@ class Handler(BaseHTTPRequestHandler):
     def _host_ok(self) -> bool:
         """Reject Host headers we don't recognize (anti DNS-rebinding)."""
         host = self.headers.get("Host", "")
-        name = (host[1:host.index("]")] if host.startswith("[") and "]" in host
-                else host.rsplit(":", 1)[0] if ":" in host else host)
-        return name in ALLOWED_HOSTS or host in ALLOWED_HOSTS
+        return _host_only(host) in ALLOWED_HOSTS or host in ALLOWED_HOSTS
 
     def log_message(self, format, *args):  # noqa: A002 (match base signature)
         print(f"[{self.log_date_time_string()}] {format % args}")
@@ -788,8 +817,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(403, "host not allowed", "forbidden")
         if self.path == "/health":
             try:
-                a = get_auth()
-                exp = a.get("exp")
+                # read-only: a health probe must never trigger a network token
+                # refresh (could block ~30s) nor leak auth.json search paths.
+                if _cached:
+                    exp = _cached.get("exp")
+                else:
+                    _, data = _read_auth_file()
+                    exp = _codex_auth.jwt_exp((data.get("tokens") or {}).get("access_token"))
                 detail = f"expires in {int(exp - time.time())}s" if exp else "loaded"
                 with _stats_lock:
                     active, queued = _stats["active"], _stats["queued"]
@@ -799,8 +833,8 @@ class Handler(BaseHTTPRequestHandler):
                                       "active": active, "queued": queued,
                                       "uptime_s": int(time.time() - _started_at),
                                       "version": __version__})
-            except Exception as e:
-                self._send_json(200, {"ok": False, "auth": str(e)})
+            except Exception:
+                self._send_json(200, {"ok": False, "auth": "unavailable; run `codex login`"})
             return
         if self.path == "/v1/models":
             self._send_json(200, {"object": "list", "data": [
@@ -866,6 +900,8 @@ class Handler(BaseHTTPRequestHandler):
             for p in parts:
                 if p["filename"] is not None or (p["name"] or "").startswith("image"):
                     if p["data"]:
+                        if len(ref_parts) >= MAX_REF_IMAGES:  # cap before decoding more
+                            return self._send_error(400, f"too many image parts (max {MAX_REF_IMAGES})")
                         ref_parts.append(_image_part_from_bytes(p["data"], p["content_type"]))
                 elif p["name"]:
                     fields[p["name"]] = p["data"].decode("utf-8", "replace")
@@ -873,8 +909,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error(400, f"bad image upload: {e}")
         if not ref_parts:
             return self._send_error(400, "at least one `image` file part is required")
-        if len(ref_parts) > MAX_REF_IMAGES:
-            return self._send_error(400, f"too many image parts (max {MAX_REF_IMAGES})")
         self._common(ref_parts=ref_parts, **_extract_params(fields))
 
 
@@ -905,6 +939,10 @@ def main():
                   "is probably serving; exiting.", flush=True)
             raise SystemExit(0)
         raise
+    if HOST not in ("127.0.0.1", "localhost", "::1"):
+        print(f"⚠️  bound to non-localhost {HOST!r}: the Host-header allowlist is NOT "
+              "authentication — do not expose this port to an untrusted network "
+              "(anyone who reaches it spends your ChatGPT subscription quota).", flush=True)
     print(f"codex-image-api {__version__} listening on http://{HOST}:{PORT}  "
           f"(concurrency={MAX_CONCURRENCY}, retries={RETRIES})")
     print("  POST /v1/images/generations   text->image (JSON; n, response_format, reference_images)")

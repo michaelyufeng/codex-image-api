@@ -113,8 +113,9 @@ def main() -> None:
 
     # high 质量单张可达 2-3 分钟；n 张按服务端并发 3 分批 → 超时按批数放大。
     # deep（effort != low）先思考再画，单批更慢 → 把每批基数也放大。
+    # +120s 留出服务端重试退避余量，避免客户端早于服务端超时把请求"断线"。
     _per_batch = 720 if a.effort != "low" else 480
-    timeout = a.timeout or (_per_batch * -(-a.count // 3))
+    timeout = a.timeout or (_per_batch * -(-a.count // 3) + 120)
 
     extra = {k: v for k, v in {
         "output_format": a.output_format,

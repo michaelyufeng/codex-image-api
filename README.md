@@ -106,7 +106,7 @@ More in [`examples/`](./examples/).
 | `input_fidelity` | *(unset)* | passed through, but upstream `gpt-image-2-codex` currently **rejects** it |
 | `moderation` | `low` | `low` / `auto` |
 | `effort` | `medium` | `low` (fast passthrough — prompt sent unchanged) / `medium` (default — model thinks first and expands your intent into a photographic brief) / `high` (deepest thinking). Anything but `low` is "deep mode": markedly more realistic, but ~2–4× slower |
-| `reference_images` | `[]` | array of local path / http(s) URL / `data:` URL / `{"data","mime"}` (image→image extension) |
+| `reference_images` | `[]` | array of local path / `data:` URL / `{"data","mime"}` (image→image extension). `http(s)` URLs are rejected unless `CODEX_IMAGE_ALLOW_REMOTE_REFS=1` (SSRF guard) |
 
 Optional passthrough fields (`background`, `output_format`, …) are only forwarded upstream when you set them. Note `effort` defaults to `medium` (deep mode), so a call that doesn't set it returns a richer, slower result with an auto-expanded prompt — pass `effort="low"` for the previous fast-passthrough behavior. If a batch (`n>1`) partially fails, the response carries the successful images plus a `warnings` array instead of failing wholesale.
 
@@ -125,6 +125,7 @@ Optional passthrough fields (`background`, `output_format`, …) are only forwar
 | `CODEX_IMAGE_ALLOWED_HOSTS` | *(auto)* | extra allowed `Host` headers (comma-separated); only localhost by default — blocks DNS rebinding |
 | `CODEX_IMAGE_MAX_BODY` | `67108864` | max request body in bytes (returns 413 if exceeded) |
 | `CODEX_IMAGE_MAX_REFS` | `16` | max `reference_images` / uploaded images per request |
+| `CODEX_IMAGE_ALLOW_REMOTE_REFS` | *(off)* | set `1` to allow `http(s)` URL reference images (forwarded upstream — SSRF risk; off by default) |
 | `CODEX_IMAGE_TIMEOUT` | `400` | upstream socket timeout per generation attempt (seconds) |
 | `CODEX_IMAGE_RETRIES` | `2` | extra attempts on transient upstream failures (network drop, 401/429/5xx, empty result) |
 
