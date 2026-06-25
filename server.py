@@ -885,6 +885,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_generations()
         if route == "/v1/images/edits":
             return self._handle_edits()
+        if route == "/v1/responses":
+            return self._handle_responses()
         self._send_error(404, f"not found: {self.path}", "not_found")
 
     def _handle_generations(self):
@@ -930,6 +932,152 @@ class Handler(BaseHTTPRequestHandler):
         if not ref_parts:
             return self._send_error(400, "at least one `image` file part is required")
         self._common(ref_parts=ref_parts, **_extract_params(fields))
+
+    def _handle_responses(self):
+        """OpenAI Responses-API compat: `client.responses.create` + an
+        `image_generation` tool. Lets a downstream that targets the official
+        Responses API (route B) hit codex with ZERO code change — it only swaps
+        OPENAI_BASE_URL. Translates the request into the same generate_images()
+        engine /v1/images uses, then returns a single Response-shaped JSON the
+        OpenAI SDK can deserialize. Does not touch _common / /v1/images."""
+        body = self._read_body()
+        if body is None:
+            return  # 400/413 already sent
+        try:
+            req = json.loads(body or b"{}")
+        except Exception:
+            return self._send_error(400, "invalid JSON body")
+
+        # 1. prompt + reference images from `input` (robust to content shapes:
+        #    content as list-of-parts OR bare str; image_url as str OR {"url":...}).
+        prompt_parts: list[str] = []
+        ref_specs: list[str] = []
+        for msg in (req.get("input") or []):
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                prompt_parts.append(content)
+                continue
+            for part in (content or []):
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype in ("input_text", "text") and isinstance(part.get("text"), str):
+                    prompt_parts.append(part["text"])
+                elif ptype in ("input_image", "image"):
+                    url = part.get("image_url")
+                    if isinstance(url, dict):
+                        url = url.get("url")
+                    if isinstance(url, str) and url:
+                        ref_specs.append(url)
+        prompt = "\n".join(p for p in prompt_parts if p).strip()
+
+        # 2. image_generation tool params + reasoning.effort. Top-level `model`
+        #    (e.g. the gpt-5.5 director) is ignored — codex uses ORCHESTRATION_MODEL.
+        tool = next((t for t in (req.get("tools") or [])
+                     if isinstance(t, dict) and t.get("type") == "image_generation"), {})
+        size = tool.get("size") or "1024x1024"
+        quality = tool.get("quality") or "high"
+        moderation = tool.get("moderation") or "low"
+        background = tool.get("background") or None
+        output_format = tool.get("output_format") or None
+        output_compression = _coerce_compression(tool.get("output_compression"))
+        input_fidelity = tool.get("input_fidelity") or None
+        reasoning = req.get("reasoning")
+        effort = (reasoning.get("effort") if isinstance(reasoning, dict) else None) or "low"
+
+        # 3. resolve refs + validate (mirror _common; n is fixed = 1 for route B).
+        if len(ref_specs) > MAX_REF_IMAGES:
+            return self._send_error(400, f"too many input_image parts (max {MAX_REF_IMAGES})")
+        try:
+            ref_parts = [_resolve_reference(s) for s in ref_specs]
+        except Exception as e:
+            return self._send_error(400, f"bad input_image: {e}")
+        if not prompt:
+            return self._send_error(400, "no input_text found in `input`")
+        if size not in VALID_SIZES:
+            return self._send_error(400, f"invalid size {size!r}; allowed: {sorted(VALID_SIZES)}")
+        if quality not in VALID_QUALITY:
+            return self._send_error(400, f"invalid quality {quality!r}")
+        if moderation not in VALID_MODERATION:
+            return self._send_error(400, f"invalid moderation {moderation!r}; allowed: low/auto")
+        if effort not in VALID_EFFORT:
+            return self._send_error(400, f"invalid effort {effort!r}; allowed: low/medium/high")
+        if background is not None and background not in VALID_BACKGROUND:
+            return self._send_error(
+                400, f"invalid background {background!r}; allowed: transparent/opaque/auto")
+        if output_format is not None and output_format not in VALID_OUTPUT_FORMAT:
+            return self._send_error(
+                400, f"invalid output_format {output_format!r}; allowed: png/jpeg/webp")
+        if output_compression is not None and not (0 <= output_compression <= 100):
+            return self._send_error(400, "`output_compression` must be an integer 0-100")
+        if input_fidelity is not None and input_fidelity not in VALID_FIDELITY:
+            return self._send_error(
+                400, f"invalid input_fidelity {input_fidelity!r}; allowed: low/high")
+
+        tool_extra = {k: v for k, v in {
+            "background": background, "output_format": output_format,
+            "output_compression": output_compression, "input_fidelity": input_fidelity,
+        }.items() if v is not None}
+
+        # 4. generate (n=1) — same engine as /v1/images, with disconnect detection.
+        t0 = time.time()
+        tag = (f"[responses] quality={quality} size={size} effort={effort} "
+               f"refs={len(ref_parts)}" + (f" {tool_extra}" if tool_extra else ""))
+        alive = lambda conn=self.connection: not _client_gone(conn)  # noqa: E731
+        try:
+            results, _ = generate_images(prompt, ref_parts, size, quality,
+                                         moderation, tool_extra, 1, alive, effort)
+        except ClientDisconnected as e:
+            self.close_connection = True
+            print(f"[gen] aborted after {time.time() - t0:.1f}s ({tag}): {e}", flush=True)
+            return
+        except UpstreamError as e:
+            print(f"[gen] failed after {time.time() - t0:.1f}s ({tag}): {e}", flush=True)
+            return self._send_error(502, str(e), "upstream_error")
+        except URLError as e:
+            print(f"[gen] failed after {time.time() - t0:.1f}s ({tag}): {e}", flush=True)
+            return self._send_error(502, f"network error: {e.reason}", "upstream_error")
+        except Exception as e:
+            print(f"[gen] failed after {time.time() - t0:.1f}s ({tag}): {e}", flush=True)
+            return self._send_error(502, f"generation failed: {e}", "upstream_error")
+
+        if not results:
+            return self._send_error(502, "no image produced", "upstream_error")
+        b64, revised = results[0]
+
+        # 5. assemble a Response-shaped JSON the OpenAI SDK can deserialize.
+        #    result = PURE base64 (no data: prefix) — downstream b64decode's it.
+        digest = hashlib.sha1(b64.encode()).hexdigest()[:24]
+        img_item: dict = {
+            "type": "image_generation_call",
+            "id": f"ig_{digest}",
+            "status": "completed",
+            "result": b64,
+        }
+        if revised:  # extra field; SDK is extra="allow", downstream reads via getattr
+            img_item["revised_prompt"] = revised
+        out = {
+            "id": f"resp_{digest}",
+            "object": "response",
+            "created_at": time.time(),
+            "model": ORCHESTRATION_MODEL,
+            "status": "completed",
+            "output": [img_item],
+            "parallel_tool_calls": True,   # these three are required, non-Optional in the SDK
+            "tool_choice": "auto",
+            "tools": req.get("tools") or [],
+            "usage": None,
+        }
+        elapsed = time.time() - t0
+        print(f"[gen] ok 1/1 in {elapsed:.1f}s ({tag})", flush=True)
+        try:
+            self._send_json(200, out)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+            print(f"[gen] client disconnected before the response could be sent "
+                  f"({elapsed:.1f}s)", flush=True)
 
 
 class _Server(ThreadingHTTPServer):
